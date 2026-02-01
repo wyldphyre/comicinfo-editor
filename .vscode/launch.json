@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Tauri (Rust)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/src-tauri/target/debug/comicinfo-editor",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_BACKTRACE": "1"
+            },
+            "preLaunchTask": "Build Tauri (Debug)",
+            "sourceLanguages": ["rust"]
+        },
+        {
+            "name": "Debug Tauri (Attach)",
+            "type": "lldb",
+            "request": "attach",
+            "program": "${workspaceFolder}/src-tauri/target/debug/comicinfo-editor",
+            "sourceLanguages": ["rust"]
+        }
+    ]
+}

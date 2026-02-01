@@ -1,0 +1,65 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Tauri (Debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--manifest-path",
+                "src-tauri/Cargo.toml"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$rustc"
+            ]
+        },
+        {
+            "label": "Build Tauri (Release)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--release",
+                "--manifest-path",
+                "src-tauri/Cargo.toml"
+            ],
+            "group": "build",
+            "problemMatcher": [
+                "$rustc"
+            ]
+        },
+        {
+            "label": "Bundle Tauri App",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "tauri",
+                "build"
+            ],
+            "group": "build",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "detail": "Build and bundle the app (.app, .dmg, etc.)"
+        },
+        {
+            "label": "Run Tauri Dev",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "tauri",
+                "dev"
+            ],
+            "group": "build",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "isBackground": true
+        }
+    ]
+}
