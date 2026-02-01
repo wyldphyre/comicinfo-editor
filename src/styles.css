@@ -286,6 +286,13 @@ body {
     border-top: 1px solid var(--border);
     font-size: 0.85rem;
     color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.status-bar .version {
+    opacity: 0.7;
 }
 
 /* Scrollbar */
