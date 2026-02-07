@@ -31,10 +31,29 @@ fn open_cbz(path: String) -> Result<ComicInfo, String> {
 
 #[tauri::command]
 fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
-    let xml_content = comic_info.to_xml()?;
+    let mut comic_info = comic_info;
 
     let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
+
+    // Auto-populate PageCount if not provided
+    if comic_info.page_count.is_none() {
+        let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
+        let mut count = 0;
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                let name = entry.name().to_lowercase();
+                if let Some(ext) = Path::new(&name).extension() {
+                    if image_extensions.contains(&ext.to_str().unwrap_or("")) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        comic_info.page_count = Some(count);
+    }
+
+    let xml_content = comic_info.to_xml()?;
 
     let temp_path = format!("{}.tmp", path);
     let temp_file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
