@@ -1,4 +1,5 @@
 mod comicinfo;
+mod filename_parser;
 
 use comicinfo::ComicInfo;
 use std::fs::File;
@@ -26,7 +27,17 @@ fn open_cbz(path: String) -> Result<ComicInfo, String> {
         }
     }
 
-    Ok(ComicInfo::default())
+    // No ComicInfo.xml found — try to infer metadata from the filename
+    let parsed = filename_parser::parse(&path);
+    Ok(ComicInfo {
+        series: parsed.series,
+        volume: parsed.volume,
+        number: parsed.number,
+        title: parsed.name,
+        writer: parsed.artist,
+        year: parsed.year,
+        ..ComicInfo::default()
+    })
 }
 
 #[tauri::command]

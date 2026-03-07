@@ -5,6 +5,7 @@ A cross-platform desktop application for editing ComicInfo.xml metadata in CBZ c
 ## Features
 
 - **Full ComicInfo v2.1 Support** - Edit all metadata fields including title, series, credits, ratings, and more
+- **Filename Inference** - When opening a file with no embedded metadata, automatically extracts series, volume, issue number, year, and artist from the filename
 - **Cover Preview** - Displays the cover image from the CBZ archive
 - **Drag & Drop** - Drop CBZ files directly onto the app to open them
 - **Format Conversion** - Open CBR/RAR and 7z/CB7 files and convert them to CBZ automatically
@@ -50,7 +51,7 @@ cargo tauri build
 
 ## Usage
 
-1. **Open a file** - Click "Open CBZ" or drag a file onto the window. CBR, RAR, 7z, and CB7 files will be offered conversion to CBZ automatically
+1. **Open a file** - Click "Open CBZ" or drag a file onto the window. CBR, RAR, 7z, and CB7 files will be offered conversion to CBZ automatically. If the file contains no ComicInfo.xml, metadata is inferred from the filename where possible.
 2. **Edit metadata** - Navigate through tabs to edit different field categories:
    - **Basic** - Title, series, issue number, volume
    - **Description** - Summary, notes, review
@@ -100,3 +101,4 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 ## TODO
 
 - Allow passing a file to the app/bundle via the command line to open it
+- Run backend unit tests: `cargo test` (from the `src-tauri` directory)
