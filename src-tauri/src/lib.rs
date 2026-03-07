@@ -1,5 +1,6 @@
 mod comicinfo;
 mod filename_parser;
+pub mod cli;
 
 use comicinfo::ComicInfo;
 use std::fs::File;
@@ -10,41 +11,29 @@ use zip::write::ZipWriter;
 use zip::write::SimpleFileOptions;
 use base64::{engine::general_purpose::STANDARD, Engine};
 
-#[tauri::command]
-fn open_cbz(path: String) -> Result<ComicInfo, String> {
-    let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
+/// Read the ComicInfo from a CBZ archive. Returns `None` if no ComicInfo.xml is present.
+pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        let name = file.name().to_lowercase();
-
-        if name == "comicinfo.xml" {
+        let mut entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        if entry.name().to_lowercase() == "comicinfo.xml" {
             let mut contents = String::new();
-            file.read_to_string(&mut contents)
+            entry.read_to_string(&mut contents)
                 .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
-            return ComicInfo::from_xml(&contents);
+            return Ok(Some(ComicInfo::from_xml(&contents)?));
         }
     }
 
-    // No ComicInfo.xml found — try to infer metadata from the filename
-    let parsed = filename_parser::parse(&path);
-    Ok(ComicInfo {
-        series: parsed.series,
-        volume: parsed.volume,
-        number: parsed.number,
-        title: parsed.name,
-        writer: parsed.artist,
-        year: parsed.year,
-        ..ComicInfo::default()
-    })
+    Ok(None)
 }
 
-#[tauri::command]
-fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
+/// Write ComicInfo back into a CBZ archive, auto-populating PageCount if not set.
+pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String> {
     let mut comic_info = comic_info;
 
-    let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
     // Auto-populate PageCount if not provided
@@ -97,9 +86,34 @@ fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
 
     writer.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
 
-    std::fs::rename(&temp_path, &path).map_err(|e| format!("Failed to replace original file: {}", e))?;
+    std::fs::rename(&temp_path, path).map_err(|e| format!("Failed to replace original file: {}", e))?;
 
     Ok(())
+}
+
+#[tauri::command]
+fn open_cbz(path: String) -> Result<ComicInfo, String> {
+    match read_comic_info(&path)? {
+        Some(info) => Ok(info),
+        None => {
+            // No ComicInfo.xml found — try to infer metadata from the filename
+            let parsed = filename_parser::parse(&path);
+            Ok(ComicInfo {
+                series: parsed.series,
+                volume: parsed.volume,
+                number: parsed.number,
+                title: parsed.name,
+                writer: parsed.artist,
+                year: parsed.year,
+                ..ComicInfo::default()
+            })
+        }
+    }
+}
+
+#[tauri::command]
+fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
+    write_comic_info(&path, comic_info)
 }
 
 #[tauri::command]

@@ -6,6 +6,7 @@ A cross-platform desktop application for editing ComicInfo.xml metadata in CBZ c
 
 - **Full ComicInfo v2.1 Support** - Edit all metadata fields including title, series, credits, ratings, and more
 - **Filename Inference** - When opening a file with no embedded metadata, automatically extracts series, volume, issue number, year, and artist from the filename
+- **CLI Batch Mode** - Process multiple files from the command line: infer metadata from filenames or set fields across a whole folder
 - **Cover Preview** - Displays the cover image from the CBZ archive
 - **Drag & Drop** - Drop CBZ files directly onto the app to open them
 - **Format Conversion** - Open CBR/RAR and 7z/CB7 files and convert them to CBZ automatically
@@ -64,6 +65,50 @@ cargo tauri build
    - **Rating** - Age rating and community rating
 3. **Save changes** - Click "Save" to write the metadata back to the CBZ file
 
+## CLI Batch Mode
+
+The app binary can be run directly from the terminal to process multiple files without opening the GUI.
+
+```bash
+# On macOS, run the binary inside the app bundle:
+/Applications/ComicInfo\ Editor.app/Contents/MacOS/comicinfo-editor [OPTIONS] <PATH>...
+
+# Or use the binary directly if built from source:
+./src-tauri/target/release/comicinfo-editor [OPTIONS] <PATH>...
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--infer` | Fill **missing** metadata fields inferred from the filename (non-destructive) |
+| `--set Field=Value` | Set a specific field on every matched file (repeatable, always overwrites) |
+| `--recursive`, `-r` | Scan folders recursively (default: non-recursive) |
+| `--help`, `-h` | Show help and a full list of settable fields |
+
+`PATH` can be a folder, a quoted glob pattern, or individual `.cbz` files.
+
+### Examples
+
+```bash
+# Infer metadata from filenames for all CBZ files in a folder
+comicinfo-editor --infer /path/to/comics/
+
+# Set Series and Year on all CBZ files in a folder
+comicinfo-editor --set Series="My Series" --set Year=2020 /path/to/comics/
+
+# Infer, then override the series name
+comicinfo-editor --infer --set Series="My Series" /path/to/comics/
+
+# Use a quoted glob pattern
+comicinfo-editor --set Publisher="Viz" "/Volumes/Comics/Naruto/*.cbz"
+
+# Scan recursively
+comicinfo-editor --infer --recursive /path/to/comics/
+```
+
+Output prints one line per file showing what changed, errors go to stderr, and a summary line at the end.
+
 ## Supported Fields
 
 All ComicInfo v2.1 specification fields are supported:
@@ -98,7 +143,9 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 - [ComicInfo Specification](https://github.com/anansi-project/comicinfo) by the Anansi Project
 
-## TODO
+## Development
 
-- Allow passing a file to the app/bundle via the command line to open it
-- Run backend unit tests: `cargo test` (from the `src-tauri` directory)
+Run backend unit tests:
+```bash
+cd src-tauri && cargo test
+```
