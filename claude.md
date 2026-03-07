@@ -6,7 +6,7 @@ A cross-platform desktop application for editing ComicInfo v2.1 metadata in CBZ 
 ## Technology Stack
 - **Framework**: Tauri v2 (Rust backend + web frontend)
 - **Frontend**: Vanilla HTML/CSS/JavaScript
-- **Archive Handling**: Rust `zip` crate
+- **Archive Handling**: Rust `zip` crate, `sevenz-rust` crate, `unar` CLI (for RAR)
 - **XML Parsing**: Rust `quick-xml` crate with serde
 
 ## Project Structure
@@ -39,6 +39,7 @@ comicinfo-editor/
 - Page count detection
 - Drag-and-drop file opening
 - Loading spinner during operations
+- CBR/RAR and 7z/CB7 to CBZ conversion (prompts user before converting)
 
 ### UI Features
 - Dark and light themes with toggle button (persisted in localStorage)
@@ -102,7 +103,6 @@ Binaries output to `src-tauri/target/release/bundle/`
 - Page metadata editing (individual page types/attributes)
 - Keyboard shortcuts
 - Undo/redo support
-- CBR (RAR) format support
 
 ## Technical Notes
 

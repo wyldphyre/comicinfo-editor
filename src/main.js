@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-const { open } = window.__TAURI__.dialog;
+const { open, ask } = window.__TAURI__.dialog;
 const { getCurrentWebview } = window.__TAURI__.webview;
 
 let currentFilePath = null;
@@ -128,15 +128,54 @@ function setupDragDrop() {
             dropZone.classList.add('hidden');
             const paths = event.payload.paths;
             if (paths.length > 0) {
-                const path = paths[0];
-                if (path.toLowerCase().endsWith('.cbz')) {
-                    await openFileByPath(path);
-                } else {
-                    setStatus('Error: Please drop a CBZ file');
-                }
+                await handleFilePath(paths[0]);
             }
         }
     });
+}
+
+async function handleFilePath(path) {
+    const lower = path.toLowerCase();
+    const isZip = lower.endsWith('.cbz') || lower.endsWith('.zip');
+
+    if (isZip) {
+        await openFileByPath(path);
+        return;
+    }
+
+    let format;
+    if (lower.endsWith('.cbr') || lower.endsWith('.rar')) {
+        format = 'RAR';
+    } else if (lower.endsWith('.cb7') || lower.endsWith('.7z')) {
+        format = '7-Zip';
+    } else {
+        setStatus('Error: Unsupported file format. Only CBZ files are supported.');
+        return;
+    }
+
+    const confirmed = await ask(
+        `This file is in ${format} format. Convert it to CBZ?`,
+        { title: 'Convert to CBZ', kind: 'info' }
+    );
+
+    if (!confirmed) {
+        setStatus('Only ZIP/CBZ files are supported.');
+        return;
+    }
+
+    try {
+        showLoading('Converting to CBZ...');
+        const newPath = await invoke('convert_to_cbz', { sourcePath: path });
+        hideLoading();
+        await openFileByPath(newPath);
+    } catch (err) {
+        hideLoading();
+        const msg = String(err).includes('unar is not installed')
+            ? 'RAR conversion requires unar. Install it with: brew install unar'
+            : `Conversion failed: ${err}`;
+        setStatus(msg);
+        console.error(err);
+    }
 }
 
 async function openFile() {
@@ -144,12 +183,12 @@ async function openFile() {
         const selected = await open({
             filters: [{
                 name: 'Comic Archives',
-                extensions: ['cbz']
+                extensions: ['cbz', 'cbr', '7z', 'cb7']
             }]
         });
 
         if (!selected) return;
-        await openFileByPath(selected);
+        await handleFilePath(selected);
     } catch (err) {
         hideLoading();
         setStatus(`Error: ${err}`);
