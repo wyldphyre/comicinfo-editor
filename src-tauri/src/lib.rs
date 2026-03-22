@@ -92,7 +92,7 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
 }
 
 #[tauri::command]
-fn open_cbz(path: String) -> Result<ComicInfo, String> {
+async fn open_cbz(path: String) -> Result<ComicInfo, String> {
     match read_comic_info(&path)? {
         Some(info) => Ok(info),
         None => {
@@ -112,12 +112,12 @@ fn open_cbz(path: String) -> Result<ComicInfo, String> {
 }
 
 #[tauri::command]
-fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
+async fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
     write_comic_info(&path, comic_info)
 }
 
 #[tauri::command]
-fn get_page_count(path: String) -> Result<i32, String> {
+async fn get_page_count(path: String) -> Result<i32, String> {
     let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
@@ -139,7 +139,7 @@ fn get_page_count(path: String) -> Result<i32, String> {
 }
 
 #[tauri::command]
-fn extract_cover(path: String) -> Result<String, String> {
+async fn extract_cover(path: String) -> Result<String, String> {
     let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
@@ -184,7 +184,7 @@ fn extract_cover(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn convert_to_cbz(source_path: String) -> Result<String, String> {
+async fn convert_to_cbz(source_path: String) -> Result<String, String> {
     let source = Path::new(&source_path);
     let ext = source.extension()
         .and_then(|e| e.to_str())
