@@ -66,11 +66,13 @@ const fieldMap = {
 };
 
 // Initialize
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
     setupTheme();
     setupTabs();
     setupButtons();
     setupDragDrop();
+    const version = await window.__TAURI__.app.getVersion();
+    document.getElementById('app-version').textContent = `v${version}`;
 });
 
 function setupTheme() {
@@ -229,6 +231,8 @@ async function openFileByPath(path) {
 async function saveFile() {
     if (!currentFilePath) return;
 
+    btnSave.disabled = true;
+    btnSave.textContent = 'Saving...';
     try {
         showLoading('Saving file...');
         const comicInfo = collectFormData();
@@ -239,6 +243,9 @@ async function saveFile() {
         hideLoading();
         setStatus(`Error: ${err}`);
         console.error(err);
+    } finally {
+        btnSave.disabled = false;
+        btnSave.textContent = 'Save';
     }
 }
 

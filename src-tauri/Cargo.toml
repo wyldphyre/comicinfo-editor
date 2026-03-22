@@ -1,6 +1,6 @@
 [package]
 name = "comicinfo-editor"
-version = "1.4.0"
+version = "1.5.0"
 description = "A desktop application for editing ComicInfo v2.1 metadata in CBZ files"
 authors = ["you"]
 edition = "2021"
