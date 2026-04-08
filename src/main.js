@@ -73,6 +73,14 @@ window.addEventListener('DOMContentLoaded', async () => {
     setupDragDrop();
     const version = await window.__TAURI__.app.getVersion();
     document.getElementById('app-version').textContent = `v${version}`;
+
+    // Register the listener and wait for the Rust event system to confirm it,
+    // then tell the backend we're ready. The backend will immediately emit any
+    // file that arrived via "Open With" before the frontend was loaded.
+    await window.__TAURI__.event.listen('open-file', (event) => {
+        handleFilePath(event.payload);
+    });
+    await invoke('frontend_ready');
 });
 
 function setupTheme() {

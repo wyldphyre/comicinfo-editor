@@ -6,10 +6,19 @@ use comicinfo::ComicInfo;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use zip::read::ZipArchive;
 use zip::write::ZipWriter;
 use zip::write::SimpleFileOptions;
 use base64::{engine::general_purpose::STANDARD, Engine};
+
+
+struct AppState {
+    /// File path received from "Open With" before the frontend listener was ready.
+    pending_file: Mutex<Option<String>>,
+    /// Set to true once the frontend has called frontend_ready().
+    frontend_ready: Mutex<bool>,
+}
 
 /// Read the ComicInfo from a CBZ archive. Returns `None` if no ComicInfo.xml is present.
 pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
@@ -293,12 +302,57 @@ fn collect_images(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
     Ok(())
 }
 
+/// Called by the frontend once its `open-file` event listener is confirmed
+/// registered. Emits any file that arrived before the frontend was ready,
+/// and marks the frontend as ready so future opens emit directly.
+#[tauri::command]
+fn frontend_ready(state: tauri::State<AppState>, app: tauri::AppHandle) {
+    use tauri::Emitter;
+    let pending = {
+        let mut ready = state.frontend_ready.lock().unwrap();
+        *ready = true;
+        state.pending_file.lock().unwrap().take()
+    };
+    if let Some(path) = pending {
+        let _ = app.emit("open-file", path);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, get_page_count, extract_cover, convert_to_cbz])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .manage(AppState {
+            pending_file: Mutex::new(None),
+            frontend_ready: Mutex::new(false),
+        })
+        .setup(|_app| {
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, get_page_count, extract_cover, convert_to_cbz, frontend_ready])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if let tauri::RunEvent::Opened { urls } = &event {
+                use tauri::{Emitter, Manager};
+                for url in urls {
+                    if url.scheme() == "file" {
+                        if let Ok(path) = url.to_file_path() {
+                            let path_str = path.to_string_lossy().to_string();
+                            let state = app_handle.state::<AppState>();
+                            let is_ready = *state.frontend_ready.lock().unwrap();
+                            if is_ready {
+                                let _ = app_handle.emit("open-file", path_str);
+                            } else {
+                                *state.pending_file.lock().unwrap() = Some(path_str);
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = event;
+        });
 }
