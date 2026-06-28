@@ -211,8 +211,9 @@ async function openFileByPath(path) {
         currentFilePath = path;
         showLoading('Opening file...');
 
-        // Load comic info
-        const comicInfo = await invoke('open_cbz', { path });
+        // Single backend call: comic info, page count, and cover from one
+        // archive open (instead of three separate opens/scans).
+        const { comicInfo, pageCount: pages, cover } = await invoke('open_cbz', { path });
         populateForm(comicInfo);
 
         // Update UI
@@ -221,11 +222,9 @@ async function openFileByPath(path) {
         fileName.title = path;  // Full path as tooltip
         btnSave.disabled = false;
 
-        // Load cover and page count
-        await Promise.all([
-            loadCover(path),
-            loadPageCount(path)
-        ]);
+        // Cover and page count came back with the open call
+        showCover(cover);
+        pageCount.textContent = pages;
 
         hideLoading();
         setStatus('File loaded successfully');
@@ -257,21 +256,11 @@ async function saveFile() {
     }
 }
 
-async function loadCover(path) {
-    try {
-        const coverData = await invoke('extract_cover', { path });
+function showCover(coverData) {
+    if (coverData) {
         coverPreview.innerHTML = `<img src="${coverData}" alt="Cover">`;
-    } catch (err) {
+    } else {
         coverPreview.innerHTML = '<div class="cover-placeholder">No Cover</div>';
-    }
-}
-
-async function loadPageCount(path) {
-    try {
-        const count = await invoke('get_page_count', { path });
-        pageCount.textContent = count;
-    } catch (err) {
-        pageCount.textContent = '-';
     }
 }
 
@@ -320,7 +309,11 @@ function collectFormData() {
 
         // Handle different input types
         if (element.type === 'number') {
-            const num = parseFloat(value);
+            // Decimal fields declare a fractional step (e.g. CommunityRating);
+            // everything else maps to an integer field in the backend, so parse
+            // it as one to avoid sending a float to an i32 (which fails to save).
+            const isDecimal = element.step && element.step !== '' && element.step !== '1';
+            const num = isDecimal ? parseFloat(value) : parseInt(value, 10);
             data[dataKey] = isNaN(num) ? null : num;
         } else if (element.tagName === 'SELECT') {
             // Handle enum fields

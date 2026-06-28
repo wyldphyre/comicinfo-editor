@@ -20,6 +20,94 @@ struct AppState {
     frontend_ready: Mutex<bool>,
 }
 
+const IMAGE_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
+
+/// Everything the frontend needs after opening a file, gathered from a single
+/// pass over the archive instead of three separate opens/scans.
+#[derive(serde::Serialize)]
+struct OpenResult {
+    #[serde(rename = "comicInfo")]
+    comic_info: ComicInfo,
+    #[serde(rename = "pageCount")]
+    page_count: i32,
+    cover: Option<String>,
+}
+
+fn cover_data_url(contents: &[u8], name_lower: &str) -> String {
+    let mime_type = if name_lower.ends_with(".png") {
+        "image/png"
+    } else if name_lower.ends_with(".gif") {
+        "image/gif"
+    } else if name_lower.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+    format!("data:{};base64,{}", mime_type, STANDARD.encode(contents))
+}
+
+/// Open the archive once and gather the ComicInfo, page count, and cover image.
+fn read_archive_full(path: &str) -> Result<OpenResult, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
+
+    let mut comic_xml: Option<String> = None;
+    let mut page_count = 0;
+    let mut images: Vec<(String, usize)> = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
+        let name = entry.name().to_string();
+        let name_lower = name.to_lowercase();
+
+        if name_lower == "comicinfo.xml" {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents)
+                .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
+            comic_xml = Some(contents);
+        } else if let Some(ext) = Path::new(&name_lower).extension() {
+            if IMAGE_EXTENSIONS.contains(&ext.to_str().unwrap_or("")) {
+                page_count += 1;
+                images.push((name, i));
+            }
+        }
+    }
+
+    let comic_info = match comic_xml {
+        Some(xml) => ComicInfo::from_xml(&xml)?,
+        None => {
+            // No ComicInfo.xml found — try to infer metadata from the filename
+            let parsed = filename_parser::parse(path);
+            ComicInfo {
+                series: parsed.series,
+                volume: parsed.volume,
+                number: parsed.number,
+                title: parsed.name,
+                writer: parsed.artist,
+                year: parsed.year,
+                ..ComicInfo::default()
+            }
+        }
+    };
+
+    // Cover is the first image by sorted name.
+    images.sort_by(|a, b| a.0.cmp(&b.0));
+    let cover = match images.first() {
+        Some((name, index)) => {
+            let name_lower = name.to_lowercase();
+            let mut entry = archive.by_index(*index)
+                .map_err(|e| format!("Failed to read image: {}", e))?;
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)
+                .map_err(|e| format!("Failed to read image data: {}", e))?;
+            Some(cover_data_url(&contents, &name_lower))
+        }
+        None => None,
+    };
+
+    Ok(OpenResult { comic_info, page_count, cover })
+}
+
 /// Read the ComicInfo from a CBZ archive. Returns `None` if no ComicInfo.xml is present.
 pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
@@ -47,13 +135,12 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
 
     // Auto-populate PageCount if not provided
     if comic_info.page_count.is_none() {
-        let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
         let mut count = 0;
         for i in 0..archive.len() {
             if let Ok(entry) = archive.by_index_raw(i) {
                 let name = entry.name().to_lowercase();
                 if let Some(ext) = Path::new(&name).extension() {
-                    if image_extensions.contains(&ext.to_str().unwrap_or("")) {
+                    if IMAGE_EXTENSIONS.contains(&ext.to_str().unwrap_or("")) {
                         count += 1;
                     }
                 }
@@ -63,133 +150,63 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
     }
 
     let xml_content = comic_info.to_xml()?;
-
     let temp_path = format!("{}.tmp", path);
-    let temp_file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
-    let mut writer = ZipWriter::new(temp_file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
-    let mut comicinfo_exists = false;
+    // Write to a temp file, then atomically rename over the original. On any
+    // failure, remove the temp file so we don't leave a partial .tmp behind.
+    let write_result = (|| -> Result<(), String> {
+        let temp_file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let mut writer = ZipWriter::new(temp_file);
+        let xml_options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        let name = file.name().to_string();
+        let mut comicinfo_exists = false;
 
-        if name.to_lowercase() == "comicinfo.xml" {
-            comicinfo_exists = true;
-            writer.start_file(&name, options).map_err(|e| format!("Failed to write entry: {}", e))?;
-            writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
-        } else {
-            let mut contents = Vec::new();
-            file.read_to_end(&mut contents).map_err(|e| format!("Failed to read entry: {}", e))?;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
 
-            writer.start_file(&name, options).map_err(|e| format!("Failed to write entry: {}", e))?;
-            writer.write_all(&contents).map_err(|e| format!("Failed to write content: {}", e))?;
+            if entry.name().to_lowercase() == "comicinfo.xml" {
+                comicinfo_exists = true;
+                let name = entry.name().to_string();
+                writer.start_file(&name, xml_options).map_err(|e| format!("Failed to write entry: {}", e))?;
+                writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
+            } else {
+                // Copy the raw, already-compressed bytes straight through. This
+                // preserves each entry's original compression method and skips a
+                // needless decompress/recompress round-trip.
+                writer.raw_copy_file(entry).map_err(|e| format!("Failed to copy entry: {}", e))?;
+            }
         }
+
+        if !comicinfo_exists {
+            writer.start_file("ComicInfo.xml", xml_options).map_err(|e| format!("Failed to write ComicInfo.xml: {}", e))?;
+            writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
+        }
+
+        writer.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
     }
 
-    if !comicinfo_exists {
-        writer.start_file("ComicInfo.xml", options).map_err(|e| format!("Failed to write ComicInfo.xml: {}", e))?;
-        writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("Failed to replace original file: {}", e));
     }
-
-    writer.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
-
-    std::fs::rename(&temp_path, path).map_err(|e| format!("Failed to replace original file: {}", e))?;
 
     Ok(())
 }
 
 #[tauri::command]
-async fn open_cbz(path: String) -> Result<ComicInfo, String> {
-    match read_comic_info(&path)? {
-        Some(info) => Ok(info),
-        None => {
-            // No ComicInfo.xml found — try to infer metadata from the filename
-            let parsed = filename_parser::parse(&path);
-            Ok(ComicInfo {
-                series: parsed.series,
-                volume: parsed.volume,
-                number: parsed.number,
-                title: parsed.name,
-                writer: parsed.artist,
-                year: parsed.year,
-                ..ComicInfo::default()
-            })
-        }
-    }
+async fn open_cbz(path: String) -> Result<OpenResult, String> {
+    read_archive_full(&path)
 }
 
 #[tauri::command]
 async fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
     write_comic_info(&path, comic_info)
-}
-
-#[tauri::command]
-async fn get_page_count(path: String) -> Result<i32, String> {
-    let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
-
-    let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
-    let mut count = 0;
-
-    for i in 0..archive.len() {
-        if let Ok(file) = archive.by_index_raw(i) {
-            let name = file.name().to_lowercase();
-            if let Some(ext) = Path::new(&name).extension() {
-                if image_extensions.contains(&ext.to_str().unwrap_or("")) {
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    Ok(count)
-}
-
-#[tauri::command]
-async fn extract_cover(path: String) -> Result<String, String> {
-    let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
-
-    let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
-    let mut images: Vec<(String, usize)> = Vec::new();
-
-    for i in 0..archive.len() {
-        if let Ok(file) = archive.by_index_raw(i) {
-            let name = file.name().to_string();
-            let name_lower = name.to_lowercase();
-            if let Some(ext) = Path::new(&name_lower).extension() {
-                if image_extensions.contains(&ext.to_str().unwrap_or("")) {
-                    images.push((name, i));
-                }
-            }
-        }
-    }
-
-    images.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if let Some((_, index)) = images.first() {
-        let mut file = archive.by_index(*index).map_err(|e| format!("Failed to read image: {}", e))?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents).map_err(|e| format!("Failed to read image data: {}", e))?;
-
-        let name = file.name().to_lowercase();
-        let mime_type = if name.ends_with(".png") {
-            "image/png"
-        } else if name.ends_with(".gif") {
-            "image/gif"
-        } else if name.ends_with(".webp") {
-            "image/webp"
-        } else {
-            "image/jpeg"
-        };
-
-        let base64_data = STANDARD.encode(&contents);
-        return Ok(format!("data:{};base64,{}", mime_type, base64_data));
-    }
-
-    Err("No images found in archive".to_string())
 }
 
 #[tauri::command]
@@ -331,7 +348,7 @@ pub fn run() {
         .setup(|_app| {
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, get_page_count, extract_cover, convert_to_cbz, frontend_ready])
+        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, convert_to_cbz, frontend_ready])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
@@ -343,8 +360,13 @@ pub fn run() {
                         if let Ok(path) = url.to_file_path() {
                             let path_str = path.to_string_lossy().to_string();
                             let state = app_handle.state::<AppState>();
-                            let is_ready = *state.frontend_ready.lock().unwrap();
-                            if is_ready {
+                            // Hold the frontend_ready lock across the check-and-set so we
+                            // can't race frontend_ready(): otherwise the frontend could
+                            // flip to ready (and take an empty pending_file) between our
+                            // check and our store, dropping the file silently.
+                            let ready = state.frontend_ready.lock().unwrap();
+                            if *ready {
+                                drop(ready);
                                 let _ = app_handle.emit("open-file", path_str);
                             } else {
                                 *state.pending_file.lock().unwrap() = Some(path_str);

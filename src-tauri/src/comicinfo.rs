@@ -195,6 +195,44 @@ pub struct ComicInfo {
 
     #[serde(rename = "GTIN", skip_serializing_if = "Option::is_none")]
     pub gtin: Option<String>,
+
+    /// Per-page metadata. Not editable in the UI, but preserved on save so it
+    /// is not destroyed when re-writing the archive.
+    #[serde(rename = "Pages", skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Pages>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Pages {
+    #[serde(rename = "Page", default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<Page>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Page {
+    #[serde(rename = "@Image", skip_serializing_if = "Option::is_none")]
+    pub image: Option<i32>,
+
+    #[serde(rename = "@Type", skip_serializing_if = "Option::is_none")]
+    pub page_type: Option<String>,
+
+    #[serde(rename = "@DoublePage", skip_serializing_if = "Option::is_none")]
+    pub double_page: Option<bool>,
+
+    #[serde(rename = "@ImageSize", skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<i64>,
+
+    #[serde(rename = "@Key", skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    #[serde(rename = "@Bookmark", skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<String>,
+
+    #[serde(rename = "@ImageWidth", skip_serializing_if = "Option::is_none")]
+    pub image_width: Option<i32>,
+
+    #[serde(rename = "@ImageHeight", skip_serializing_if = "Option::is_none")]
+    pub image_height: Option<i32>,
 }
 
 impl ComicInfo {
@@ -205,5 +243,36 @@ impl ComicInfo {
     pub fn to_xml(&self) -> Result<String, String> {
         let xml_body = to_string(self).map_err(|e| format!("Failed to serialize ComicInfo: {}", e))?;
         Ok(format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{}", xml_body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_round_trip_is_preserved() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo>
+  <Title>Issue 1</Title>
+  <Series>My Series</Series>
+  <Pages>
+    <Page Image="0" Type="FrontCover" ImageSize="123456" ImageWidth="800" ImageHeight="1200"/>
+    <Page Image="1" ImageSize="98765"/>
+  </Pages>
+</ComicInfo>"#;
+
+        let info = ComicInfo::from_xml(xml).expect("parse");
+        let pages = info.pages.as_ref().expect("pages parsed");
+        assert_eq!(pages.pages.len(), 2);
+        assert_eq!(pages.pages[0].image, Some(0));
+        assert_eq!(pages.pages[0].page_type.as_deref(), Some("FrontCover"));
+        assert_eq!(pages.pages[0].image_size, Some(123456));
+
+        // Re-serialize and re-parse: the page data must survive.
+        let out = info.to_xml().expect("serialize");
+        let reparsed = ComicInfo::from_xml(&out).expect("reparse");
+        assert_eq!(info.pages, reparsed.pages);
+        assert_eq!(reparsed.pages.unwrap().pages.len(), 2);
     }
 }
