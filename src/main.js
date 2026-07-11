@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-const { open, ask } = window.__TAURI__.dialog;
+const { open, ask, save } = window.__TAURI__.dialog;
 const { getCurrentWebview } = window.__TAURI__.webview;
 
 let currentFilePath = null;
@@ -173,15 +173,45 @@ async function handleFilePath(path) {
         return;
     }
 
+    // Resolve where the converted file will go, prompting before overwriting.
+    let destPath;
+    try {
+        const target = await invoke('get_conversion_target', { sourcePath: path });
+        destPath = target.path;
+        if (target.exists) {
+            const name = destPath.split('/').pop().split('\\').pop();
+            const replace = await ask(
+                `"${name}" already exists. Replace it?`,
+                { title: 'File Exists', kind: 'warning' }
+            );
+            if (!replace) {
+                const chosen = await save({
+                    title: 'Save Converted CBZ As',
+                    defaultPath: destPath,
+                    filters: [{ name: 'Comic Archive', extensions: ['cbz'] }]
+                });
+                if (!chosen) {
+                    setStatus('Conversion cancelled.');
+                    return;
+                }
+                destPath = chosen;
+            }
+        }
+    } catch (err) {
+        setStatus(`Error: ${err}`);
+        console.error(err);
+        return;
+    }
+
     try {
         showLoading('Converting to CBZ...');
-        const newPath = await invoke('convert_to_cbz', { sourcePath: path });
+        const newPath = await invoke('convert_to_cbz', { sourcePath: path, destPath });
         hideLoading();
         await openFileByPath(newPath);
     } catch (err) {
         hideLoading();
         const msg = String(err).includes('unar is not installed')
-            ? 'RAR conversion requires unar. Install it with: brew install unar'
+            ? "RAR conversion requires unar. Install it (e.g. 'brew install unar' on macOS)."
             : `Conversion failed: ${err}`;
         setStatus(msg);
         console.error(err);

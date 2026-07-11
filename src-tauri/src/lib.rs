@@ -209,15 +209,36 @@ async fn save_cbz(path: String, comic_info: ComicInfo) -> Result<(), String> {
     write_comic_info(&path, comic_info)
 }
 
+/// The default CBZ path a conversion would produce, and whether it already exists.
+#[derive(serde::Serialize)]
+struct ConversionTarget {
+    path: String,
+    exists: bool,
+}
+
 #[tauri::command]
-async fn convert_to_cbz(source_path: String) -> Result<String, String> {
+async fn get_conversion_target(source_path: String) -> Result<ConversionTarget, String> {
+    let dest = Path::new(&source_path).with_extension("cbz");
+    Ok(ConversionTarget {
+        exists: dest.exists(),
+        path: dest.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+async fn convert_to_cbz(source_path: String, dest_path: Option<String>) -> Result<String, String> {
     let source = Path::new(&source_path);
     let ext = source.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    let dest_path = source.with_extension("cbz");
+    // The frontend supplies an explicit destination when it had to resolve a
+    // name collision; otherwise fall back to the default <source>.cbz.
+    let dest_path = match dest_path {
+        Some(p) => PathBuf::from(p),
+        None => source.with_extension("cbz"),
+    };
 
     let temp_dir = tempfile::tempdir()
         .map_err(|e| format!("Failed to create temp directory: {}", e))?;
@@ -239,18 +260,34 @@ fn extract_7z(source: &str, dest_dir: &Path) -> Result<(), String> {
 }
 
 fn find_unar() -> Option<PathBuf> {
-    // Bundled apps don't inherit shell PATH, so check known locations directly
+    // Bundled apps don't inherit the shell PATH, so check known install
+    // locations directly first.
     let candidates = [
-        "/opt/homebrew/bin/unar",  // Apple Silicon Homebrew
-        "/usr/local/bin/unar",     // Intel Mac Homebrew
-        "/usr/bin/unar",
+        "/opt/homebrew/bin/unar", // Apple Silicon Homebrew
+        "/usr/local/bin/unar",    // Intel Mac Homebrew
+        "/usr/bin/unar",          // Linux package managers
     ];
-    candidates.iter().find(|p| Path::new(p).exists()).map(PathBuf::from)
+    if let Some(found) = candidates.iter().find(|p| Path::new(p).exists()).map(PathBuf::from) {
+        return Some(found);
+    }
+
+    // Fall back to searching PATH — covers Linux, Windows, and custom installs.
+    let exe_names: &[&str] = if cfg!(windows) { &["unar.exe", "unar"] } else { &["unar"] };
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in exe_names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn extract_rar(source: &str, dest_dir: &Path) -> Result<(), String> {
     let unar = find_unar()
-        .ok_or_else(|| "unar is not installed. Install it with: brew install unar".to_string())?;
+        .ok_or_else(|| "unar is not installed or was not found on PATH. Install it (e.g. 'brew install unar' on macOS).".to_string())?;
 
     let output = std::process::Command::new(unar)
         .args(["-output-directory", &dest_dir.to_string_lossy(), "-force-overwrite", source])
@@ -265,22 +302,25 @@ fn extract_rar(source: &str, dest_dir: &Path) -> Result<(), String> {
 }
 
 fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
-    let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp"];
-
     let dest_file = File::create(dest_path)
         .map_err(|e| format!("Failed to create CBZ file: {}", e))?;
     let mut writer = ZipWriter::new(dest_file);
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
 
-    let mut image_files: Vec<PathBuf> = Vec::new();
-    collect_images(source_dir, &image_extensions, &mut image_files)?;
-    image_files.sort();
+    // Collect every file (images, ComicInfo.xml, and any other sidecars) so
+    // conversion doesn't silently drop existing metadata. Sorting keeps image
+    // pages in order; ComicInfo.xml naturally sorts after numeric page names.
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(source_dir, &mut files)?;
+    files.sort();
 
-    for path in &image_files {
+    for path in &files {
         let rel_path = path.strip_prefix(source_dir)
             .map_err(|e| format!("Path error: {}", e))?;
-        let entry_name = rel_path.to_string_lossy().to_string();
+        // Zip entry names must use '/' separators on every platform, so
+        // normalise the backslashes that Windows paths would otherwise produce.
+        let entry_name = rel_path.to_string_lossy().replace('\\', "/");
 
         let mut contents = Vec::new();
         File::open(path)
@@ -299,7 +339,22 @@ fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_images(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> Result<(), String> {
+/// True for OS-generated junk that should never be packed into the archive.
+fn is_junk_file(path: &Path) -> bool {
+    // AppleDouble/resource-fork artifacts and thumbnail caches that archive
+    // extraction may produce; not part of the user's actual content.
+    path.components().any(|c| c.as_os_str() == "__MACOSX")
+        || matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(".DS_Store") | Some("Thumbs.db")
+        )
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n.starts_with("._"))
+}
+
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("Failed to read directory: {}", e))?;
 
@@ -308,11 +363,9 @@ fn collect_images(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) -> 
         let path = entry.path();
 
         if path.is_dir() {
-            collect_images(&path, extensions, files)?;
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if extensions.contains(&ext.to_lowercase().as_str()) {
-                files.push(path);
-            }
+            collect_files(&path, files)?;
+        } else if !is_junk_file(&path) {
+            files.push(path);
         }
     }
 
@@ -348,7 +401,7 @@ pub fn run() {
         .setup(|_app| {
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, convert_to_cbz, frontend_ready])
+        .invoke_handler(tauri::generate_handler![open_cbz, save_cbz, get_conversion_target, convert_to_cbz, frontend_ready])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
