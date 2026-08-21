@@ -27,6 +27,19 @@ pub fn run(args_vec: Vec<String>) -> i32 {
         }
     };
 
+    // Check every --set name and value against a throwaway record first. A typo
+    // would otherwise fail identically on every file in the batch, after the
+    // run had already started rewriting the ones that came before it.
+    {
+        let mut probe = ComicInfo::default();
+        for (name, value) in &cli.set_fields {
+            if let Err(e) = apply_field(&mut probe, name, value) {
+                eprintln!("Error: {}", e);
+                return 1;
+            }
+        }
+    }
+
     let files = collect_files(&cli);
 
     if files.is_empty() {
@@ -72,7 +85,9 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
-                print_usage();
+                // Requested help is output, not an error — it belongs on stdout
+                // so it can be piped into a pager or grep.
+                println!("{}", usage());
                 std::process::exit(0);
             }
             "--infer" => cli.infer = true,
@@ -160,7 +175,11 @@ fn collect_from_dir(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) {
 }
 
 fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
-    let path_str = path.to_str().unwrap_or_default();
+    // Silently becoming "" here turned a path problem into a confusing
+    // "Failed to open file" against an empty filename.
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "path is not valid UTF-8".to_string())?;
     let existing = crate::read_comic_info(path_str)?;
     let mut info = existing.unwrap_or_default();
     let mut changes: Vec<String> = Vec::new();
@@ -301,7 +320,7 @@ fn parse_manga(field: &str, value: &str) -> Result<Manga, String> {
     match value.to_ascii_lowercase().as_str() {
         "yes" => Ok(Manga::Yes),
         "no" => Ok(Manga::No),
-        "yesandrightoleft" | "rtl" | "right-to-left" => Ok(Manga::YesAndRightToLeft),
+        "yesandrighttoleft" | "rtl" | "right-to-left" => Ok(Manga::YesAndRightToLeft),
         "unknown" | "" => Ok(Manga::Unknown),
         _ => Err(format!("'{}' is not valid for {} — use Yes, No, YesAndRightToLeft, or Unknown", value, field)),
     }
@@ -329,7 +348,11 @@ fn parse_age_rating(_field: &str, value: &str) -> Result<AgeRating, String> {
 }
 
 fn print_usage() {
-    eprintln!(
+    eprintln!("{}", usage());
+}
+
+fn usage() -> String {
+    String::from(
         "Usage: comicinfo-editor [OPTIONS] <PATH>...
 
 Options:
@@ -370,5 +393,84 @@ Examples:
   # Run directly from the macOS app bundle
   /Applications/ComicInfo\\ Editor.app/Contents/MacOS/comicinfo-editor --infer /path/to/comics/
 "
-    );
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical spelling used in --help must round-trip. It previously did
+    /// not: the match arm was missing a letter, so only the "rtl" aliases worked.
+    #[test]
+    fn manga_accepts_its_canonical_name() {
+        for input in ["YesAndRightToLeft", "yesandrighttoleft", "YESANDRIGHTTOLEFT", "rtl", "right-to-left"] {
+            assert_eq!(
+                parse_manga("Manga", input).unwrap(),
+                Manga::YesAndRightToLeft,
+                "input: {}",
+                input
+            );
+        }
+        assert_eq!(parse_manga("Manga", "Yes").unwrap(), Manga::Yes);
+        assert_eq!(parse_manga("Manga", "").unwrap(), Manga::Unknown);
+        assert!(parse_manga("Manga", "sideways").is_err());
+    }
+
+    #[test]
+    fn every_age_rating_in_the_help_text_parses() {
+        let help = usage();
+        for value in [
+            "Unknown", "Everyone", "Teen", "M", "MA15+", "Mature 17+", "Adults Only 18+",
+            "PG", "G", "R18+", "X18+", "Early Childhood", "Everyone 10+", "Kids to Adults",
+            "Rating Pending",
+        ] {
+            assert!(help.contains(value), "{} is missing from --help", value);
+            assert!(parse_age_rating("AgeRating", value).is_ok(), "{} does not parse", value);
+        }
+    }
+
+    #[test]
+    fn yes_no_parses_both_cases() {
+        assert_eq!(parse_yes_no("BlackAndWhite", "YES").unwrap(), YesNo::Yes);
+        assert_eq!(parse_yes_no("BlackAndWhite", "no").unwrap(), YesNo::No);
+        assert!(parse_yes_no("BlackAndWhite", "maybe").is_err());
+    }
+
+    /// Every field named in the --help text must actually be settable.
+    #[test]
+    fn all_documented_set_fields_are_accepted() {
+        let fields = [
+            "Series", "Title", "Number", "AlternateSeries", "AlternateNumber", "Summary",
+            "Notes", "Writer", "Penciller", "Inker", "Colorist", "Letterer", "CoverArtist",
+            "Editor", "Translator", "Publisher", "Imprint", "Genre", "Tags", "Characters",
+            "Teams", "Locations", "Format", "LanguageISO", "Web", "GTIN", "ScanInformation",
+            "StoryArc", "StoryArcNumber", "SeriesGroup", "MainCharacterOrTeam", "Review",
+        ];
+        for field in fields {
+            let mut info = ComicInfo::default();
+            assert!(apply_field(&mut info, field, "x").is_ok(), "{} rejected", field);
+        }
+
+        for field in ["Volume", "Count", "AlternateCount", "Year", "Month", "Day", "PageCount"] {
+            let mut info = ComicInfo::default();
+            assert!(apply_field(&mut info, field, "3").is_ok(), "{} rejected", field);
+            assert!(apply_field(&mut info, field, "abc").is_err(), "{} took a non-integer", field);
+        }
+    }
+
+    #[test]
+    fn set_value_splits_on_the_first_equals_only() {
+        let (name, value) = split_field_value("Web=https://example.com/?a=1").unwrap();
+        assert_eq!(name, "Web");
+        assert_eq!(value, "https://example.com/?a=1");
+        assert!(split_field_value("NoEquals").is_err());
+    }
+
+    #[test]
+    fn unknown_set_field_is_reported() {
+        let mut info = ComicInfo::default();
+        let err = apply_field(&mut info, "Sereis", "x").unwrap_err();
+        assert!(err.contains("Unknown field"), "got: {}", err);
+    }
 }

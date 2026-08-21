@@ -6,7 +6,7 @@ A cross-platform desktop application for editing ComicInfo v2.1 metadata in CBZ 
 ## Technology Stack
 - **Framework**: Tauri v2 (Rust backend + web frontend)
 - **Frontend**: Vanilla HTML/CSS/JavaScript
-- **Archive Handling**: Rust `zip` crate, `sevenz-rust` crate, `unar` CLI (for RAR)
+- **Archive Handling**: Rust `zip` crate, `sevenz-rust2` crate, `unar` CLI (for RAR)
 - **XML Parsing**: Rust `quick-xml` crate with serde
 
 ## Project Structure
@@ -18,9 +18,11 @@ comicinfo-editor/
 │   └── main.js             # Frontend logic & Tauri API calls
 ├── src-tauri/              # Rust backend
 │   ├── src/
-│   │   ├── main.rs         # Entry point
-│   │   ├── lib.rs          # Tauri commands
-│   │   └── comicinfo.rs    # ComicInfo struct & XML handling
+│   │   ├── main.rs         # Entry point (GUI vs CLI dispatch)
+│   │   ├── lib.rs          # Tauri commands & archive read/write
+│   │   ├── cli.rs          # Batch mode (--infer / --set)
+│   │   ├── filename_parser.rs  # Metadata inference from filenames
+│   │   └── comicinfo.rs    # ComicInfo struct, XML handling, validation
 │   ├── Cargo.toml          # Rust dependencies
 │   ├── tauri.conf.json     # App configuration
 │   └── capabilities/       # Tauri permissions
@@ -40,6 +42,8 @@ comicinfo-editor/
 - Drag-and-drop file opening
 - Loading spinner during operations
 - CBR/RAR and 7z/CB7 to CBZ conversion (prompts user before converting)
+- Unsaved-changes prompt before opening another file or closing the window
+- Batch CLI mode: `--infer` and `--set Field=Value` (see `--help`)
 
 ### UI Features
 - Dark and light themes with toggle button (persisted in localStorage)
@@ -111,6 +115,14 @@ Binaries output to `src-tauri/target/release/bundle/`
 - The app preserves other files in the archive when saving
 - XML field names use PascalCase (e.g., "AlternateSeries")
 - Serde renames are used for XML compatibility, affecting JSON keys sent to frontend
+- The GUI form has no `<Pages>` editor, so save payloads arrive without it;
+  `write_comic_info` recovers Pages from the archive rather than dropping it
+- Saves go to a temp file that is fsync'd and renamed, so an interrupted write
+  cannot leave a truncated archive in place of the original
+- Numeric fields use -1 as the schema's "unset" sentinel; `ComicInfo::validate`
+  accepts it and is the single bounds check for both the GUI and CLI paths
+- "Open With" arrives via `RunEvent::Opened` on macOS and via argv elsewhere;
+  `tauri-plugin-single-instance` routes a second launch into the running window
 
 ## Resources
 
