@@ -77,11 +77,11 @@
                             </div>
                             <div class="form-group">
                                 <label for="count">Count</label>
-                                <input type="number" id="count" name="count">
+                                <input type="number" id="count" name="count" step="1" min="-1">
                             </div>
                             <div class="form-group">
                                 <label for="volume">Volume</label>
-                                <input type="number" id="volume" name="volume">
+                                <input type="number" id="volume" name="volume" step="1" min="-1">
                             </div>
                         </div>
                         <div class="form-group">
@@ -95,7 +95,7 @@
                             </div>
                             <div class="form-group">
                                 <label for="alternate_count">Alternate Count</label>
-                                <input type="number" id="alternate_count" name="alternate_count">
+                                <input type="number" id="alternate_count" name="alternate_count" step="1" min="-1">
                             </div>
                         </div>
                     </section>
@@ -121,15 +121,15 @@
                         <div class="form-row">
                             <div class="form-group">
                                 <label for="year">Year</label>
-                                <input type="number" id="year" name="year" min="1900" max="2100">
+                                <input type="number" id="year" name="year" step="1" min="-1" max="9999">
                             </div>
                             <div class="form-group">
                                 <label for="month">Month</label>
-                                <input type="number" id="month" name="month" min="1" max="12">
+                                <input type="number" id="month" name="month" step="1" min="-1" max="12">
                             </div>
                             <div class="form-group">
                                 <label for="day">Day</label>
-                                <input type="number" id="day" name="day" min="1" max="31">
+                                <input type="number" id="day" name="day" step="1" min="-1" max="31">
                             </div>
                         </div>
                     </section>
@@ -234,7 +234,7 @@
                         </div>
                         <div class="form-group">
                             <label for="page_count">Page Count</label>
-                            <input type="number" id="page_count" name="page_count">
+                            <input type="number" id="page_count" name="page_count" step="1" min="0">
                         </div>
                         <div class="form-group">
                             <label for="language_iso">Language (ISO)</label>
@@ -297,7 +297,7 @@
                         </div>
                         <div class="form-group">
                             <label for="community_rating">Community Rating (0-5)</label>
-                            <input type="number" id="community_rating" name="community_rating" min="0" max="5" step="0.1">
+                            <input type="number" id="community_rating" name="community_rating" min="0" max="5" step="any">
                         </div>
                     </section>
                 </form>

@@ -47,9 +47,12 @@ pub fn parse(filename: &str) -> ParsedFilenameData {
                 }
             }
         } else if let Some(num) = try_parse_number(trimmed) {
+            // The chapter number is contained in this token ("ch01"), so unlike
+            // the "ch" + "01" case above there is no following token to consume.
+            // Skipping one anyway swallowed whatever came next — the "-" that
+            // introduces the issue title, or a "(year)" tag.
             result.number = Some(num);
             is_past_series = true;
-            index += 1; // extra increment matching C# behaviour
         } else if let Some(year) = try_parse_year(trimmed) {
             result.year = Some(year);
             is_past_series = true;
@@ -253,8 +256,15 @@ fn remove_bracketed(s: String, open: char, close: char) -> String {
     s
 }
 
+/// Drop padding zeros so "001" becomes "1". A run of nothing but zeros is the
+/// number zero, not an absent number, so it must not collapse to "".
 fn trim_leading_zeros(s: &str) -> String {
-    s.trim_start_matches('0').to_string()
+    let trimmed = s.trim_start_matches('0');
+    if trimmed.is_empty() || trimmed.starts_with('.') {
+        format!("0{}", trimmed)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +597,52 @@ mod tests {
             (
                 "Ascender 001 (2019) (Digital) (Zone-Empire).cbz",
                 p(Some("Ascender"), None, Some("1"), None, None, Some(2019)),
+            ),
+
+            // A "chNN"/"cNN" token carries its own number, so the token after
+            // it must still be parsed — previously it was skipped, silently
+            // losing the issue title and any year tag.
+            (
+                "Claymore ch01 - Silver-eyed Slayer.cbz",
+                p(Some("Claymore"), None, Some("1"), Some("Silver-eyed Slayer"), None, None),
+            ),
+            (
+                "Claymore c02 - Claws in the Sky [m-s].cbz",
+                p(Some("Claymore"), None, Some("2"), Some("Claws in the Sky"), None, None),
+            ),
+            (
+                "Vampeerz v1 ch01 - The Beginning.cbz",
+                p(Some("Vampeerz"), Some(1), Some("1"), Some("The Beginning"), None, None),
+            ),
+            (
+                "Ascender ch01 (2019) (Digital).cbz",
+                p(Some("Ascender"), None, Some("1"), None, None, Some(2019)),
+            ),
+            (
+                "Assassination Classroom ch01 - Assassination Time.cbz",
+                p(
+                    Some("Assassination Classroom"),
+                    None,
+                    Some("1"),
+                    Some("Assassination Time"),
+                    None,
+                    None,
+                ),
+            ),
+
+            // Issue zero: the padding is stripped, but the number itself is not.
+            ("Series 000.cbz", p(Some("Series"), None, Some("0"), None, None, None)),
+            ("Series ch00.cbz", p(Some("Series"), None, Some("0"), None, None, None)),
+            ("Series ch. 00.cbz", p(Some("Series"), None, Some("0"), None, None, None)),
+            ("00.cbz", p(None, None, Some("0"), None, None, None)),
+            (
+                "Series 000 - Prologue.cbz",
+                p(Some("Series"), None, Some("0"), Some("Prologue"), None, None),
+            ),
+            // A fractional issue below 1 keeps its leading zero.
+            (
+                "Series ch. 00.5.cbz",
+                p(Some("Series"), None, Some("0.5"), None, None, None),
             ),
         ];
 
