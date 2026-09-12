@@ -38,6 +38,72 @@ struct OpenResult {
     cover: Option<String>,
 }
 
+/// True for an OS-generated name that is not archive content: AppleDouble
+/// resource forks ("._page.jpg" and the "__MACOSX" tree that holds them) and
+/// thumbnail caches.
+fn is_junk_segment(segment: &str) -> bool {
+    segment == "__MACOSX"
+        || segment == ".DS_Store"
+        || segment == "Thumbs.db"
+        || segment.starts_with("._")
+}
+
+/// True for a zip entry name that is OS junk rather than archive content. Zip
+/// names always use '/', but a Windows-built archive can carry '\\' too.
+fn is_junk_entry(name: &str) -> bool {
+    name.split(['/', '\\']).any(is_junk_segment)
+}
+
+/// True when an archive entry is one of the comic's pages.
+///
+/// OS junk has to be excluded here, not just when packing: a CBZ built by the
+/// macOS Finder carries a "__MACOSX/.../._001.jpg" beside every real page, and
+/// counting those doubled PageCount and could hand back a 200-byte resource
+/// fork as the cover image.
+fn is_page_entry(name: &str) -> bool {
+    if is_junk_entry(name) {
+        return false;
+    }
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// True when a zip entry is a ComicInfo.xml, at the archive root or nested in a
+/// folder. Matching is case-insensitive because archives are written by tools on
+/// case-insensitive filesystems.
+fn is_comic_info_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower == "comicinfo.xml" || lower.ends_with("/comicinfo.xml")
+}
+
+/// Locate the archive's ComicInfo.xml, returning its index and exact name.
+///
+/// The root is where the spec puts it, but plenty of archives nest the whole
+/// comic in a folder. A nested file used to be ignored on open — losing every
+/// field it held — and then stranded on save as a second, conflicting metadata
+/// file. Prefer the root, then the shallowest nested candidate.
+fn find_comic_info<R: std::io::Read + std::io::Seek>(
+    archive: &ZipArchive<R>,
+) -> Option<(usize, String)> {
+    let mut best: Option<(usize, String, usize)> = None;
+    for i in 0..archive.len() {
+        let Some(name) = archive.name_for_index(i) else { continue };
+        if !is_comic_info_name(name) {
+            continue;
+        }
+        let depth = name.matches('/').count();
+        if depth == 0 {
+            return Some((i, name.to_string()));
+        }
+        if best.as_ref().is_none_or(|(_, _, shallowest)| depth < *shallowest) {
+            best = Some((i, name.to_string(), depth));
+        }
+    }
+    best.map(|(i, name, _)| (i, name))
+}
+
 /// Strip leading zeros from a digit run so "007" and "7" compare equal.
 fn trim_zeros(digits: &[u8]) -> &[u8] {
     let first_significant = digits.iter().position(|&b| b != b'0').unwrap_or(digits.len());
@@ -99,27 +165,29 @@ fn read_archive_full(path: &str) -> Result<OpenResult, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
-    let mut comic_xml: Option<String> = None;
-    let mut page_count = 0;
     let mut images: Vec<(String, usize)> = Vec::new();
-
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        let name = entry.name().to_string();
-        let name_lower = name.to_lowercase();
-
-        if name_lower == "comicinfo.xml" {
-            let mut contents = String::new();
-            entry.read_to_string(&mut contents)
-                .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
-            comic_xml = Some(contents);
-        } else if let Some(ext) = Path::new(&name_lower).extension() {
-            if IMAGE_EXTENSIONS.contains(&ext.to_str().unwrap_or("")) {
-                page_count += 1;
-                images.push((name, i));
+        if let Some(name) = archive.name_for_index(i) {
+            if is_page_entry(name) {
+                images.push((name.to_string(), i));
             }
         }
     }
+    let page_count = i32::try_from(images.len()).unwrap_or(i32::MAX);
+
+    let comic_xml = match find_comic_info(&archive) {
+        Some((index, _)) => {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|e| format!("Failed to read archive entry: {}", e))?;
+            let mut contents = String::new();
+            entry
+                .read_to_string(&mut contents)
+                .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
+            Some(contents)
+        }
+        None => None,
+    };
 
     let comic_info = match comic_xml {
         Some(xml) => ComicInfo::from_xml(&xml)?,
@@ -173,34 +241,22 @@ pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
-        if entry.name().to_lowercase() == "comicinfo.xml" {
-            let mut contents = String::new();
-            entry.read_to_string(&mut contents)
-                .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
-            return Ok(Some(ComicInfo::from_xml(&contents)?));
-        }
-    }
-
-    Ok(None)
+    let Some((index, _)) = find_comic_info(&archive) else { return Ok(None) };
+    let mut entry = archive.by_index(index).map_err(|e| format!("Failed to read archive entry: {}", e))?;
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents)
+        .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
+    Ok(Some(ComicInfo::from_xml(&contents)?))
 }
 
 /// Read the ComicInfo out of an already-open archive, ignoring any failure —
 /// callers use this only to recover fields the incoming payload omitted.
 fn existing_comic_info(archive: &mut ZipArchive<File>) -> Option<ComicInfo> {
-    for i in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(i) else { continue };
-        if entry.name().to_lowercase() != "comicinfo.xml" {
-            continue;
-        }
-        let mut contents = String::new();
-        if entry.read_to_string(&mut contents).is_ok() {
-            return ComicInfo::from_xml(&contents).ok();
-        }
-        return None;
-    }
-    None
+    let (index, _) = find_comic_info(archive)?;
+    let mut entry = archive.by_index(index).ok()?;
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents).ok()?;
+    ComicInfo::from_xml(&contents).ok()
 }
 
 /// Write ComicInfo back into a CBZ archive, auto-populating PageCount if not set.
@@ -220,19 +276,18 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
 
     // Auto-populate PageCount if not provided
     if comic_info.page_count.is_none() {
-        let mut count = 0;
-        for i in 0..archive.len() {
-            if let Ok(entry) = archive.by_index_raw(i) {
-                let name = entry.name().to_lowercase();
-                if let Some(ext) = Path::new(&name).extension() {
-                    if IMAGE_EXTENSIONS.contains(&ext.to_str().unwrap_or("")) {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        comic_info.page_count = Some(count);
+        let count = (0..archive.len())
+            .filter_map(|i| archive.name_for_index(i))
+            .filter(|name| is_page_entry(name))
+            .count();
+        comic_info.page_count = Some(i32::try_from(count).unwrap_or(i32::MAX));
     }
+
+    // Rewrite the ComicInfo.xml the archive already has, wherever it sits, and
+    // add one at the root only when there is none. Writing a fresh root copy
+    // while leaving a nested original in place left two files disagreeing about
+    // the same comic, with readers free to pick either.
+    let target = find_comic_info(&archive).map(|(_, name)| name);
 
     let xml_content = comic_info.to_xml()?;
     // Include the pid so two concurrent CLI runs over the same folder can't
@@ -246,16 +301,19 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
         let mut writer = ZipWriter::new(temp_file);
         let xml_options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        let mut comicinfo_exists = false;
-
         for i in 0..archive.len() {
             let entry = archive.by_index(i).map_err(|e| format!("Failed to read archive entry: {}", e))?;
+            let name = entry.name().to_string();
 
-            if entry.name().to_lowercase() == "comicinfo.xml" {
-                comicinfo_exists = true;
-                let name = entry.name().to_string();
+            if Some(&name) == target.as_ref() {
                 writer.start_file(&name, xml_options).map_err(|e| format!("Failed to write entry: {}", e))?;
                 writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
+            } else if is_comic_info_name(&name) {
+                // A second ComicInfo.xml elsewhere in the archive (a different
+                // casing, or a leftover nested copy) now holds stale metadata
+                // that contradicts the one we just wrote. Drop it rather than
+                // leave readers to choose between them.
+                continue;
             } else {
                 // Copy the raw, already-compressed bytes straight through. This
                 // preserves each entry's original compression method and skips a
@@ -264,7 +322,7 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
             }
         }
 
-        if !comicinfo_exists {
+        if target.is_none() {
             writer.start_file("ComicInfo.xml", xml_options).map_err(|e| format!("Failed to write ComicInfo.xml: {}", e))?;
             writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
         }
@@ -465,8 +523,14 @@ fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
         let dest_file = File::create(&temp_path)
             .map_err(|e| format!("Failed to create CBZ file: {}", e))?;
         let mut writer = ZipWriter::new(dest_file);
-        let options = SimpleFileOptions::default()
+        // Page images are already compressed, so deflating them costs CPU for
+        // no gain — but ComicInfo.xml and text sidecars shrink a lot, and
+        // storing everything made a converted archive noticeably larger than
+        // one this app writes itself.
+        let stored = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
+        let deflated = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
         // Collect every file (images, ComicInfo.xml, and any other sidecars) so
         // conversion doesn't silently drop existing metadata. Sorting keeps image
@@ -487,6 +551,7 @@ fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
                 .and_then(|mut f| f.read_to_end(&mut contents))
                 .map_err(|e| format!("Failed to read {}: {}", entry_name, e))?;
 
+            let options = if is_page_entry(&entry_name) { stored } else { deflated };
             writer.start_file(&entry_name, options)
                 .map_err(|e| format!("Failed to write {}: {}", entry_name, e))?;
             writer.write_all(&contents)
@@ -513,18 +578,11 @@ fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
 }
 
 /// True for OS-generated junk that should never be packed into the archive.
+/// Same rule the read paths apply to entry names, so a converted archive and a
+/// freshly-read one agree on what counts as content.
 fn is_junk_file(path: &Path) -> bool {
-    // AppleDouble/resource-fork artifacts and thumbnail caches that archive
-    // extraction may produce; not part of the user's actual content.
-    path.components().any(|c| c.as_os_str() == "__MACOSX")
-        || matches!(
-            path.file_name().and_then(|n| n.to_str()),
-            Some(".DS_Store") | Some("Thumbs.db")
-        )
-        || path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map_or(false, |n| n.starts_with("._"))
+    path.components()
+        .any(|c| c.as_os_str().to_str().is_some_and(is_junk_segment))
 }
 
 fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -934,6 +992,122 @@ mod tests {
         assert!(normalize(Path::new("/tmp/extract/a/../b.jpg")).starts_with(&root));
         assert!(!normalize(Path::new("/tmp/extract/../../etc/passwd")).starts_with(&root));
         assert!(!normalize(Path::new("/tmp/extract/a/../../../evil")).starts_with(&root));
+    }
+
+    /// A CBZ built by the macOS Finder carries an AppleDouble fork beside every
+    /// page. Counting those doubled PageCount, and because "_" sorts before a
+    /// letter the fork could be handed back as the cover image.
+    #[test]
+    fn apple_double_forks_are_not_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz = make_cbz(dir.path(), "m.cbz", &[
+            ("sub/001.jpg", b"REAL-COVER"),
+            ("sub/002.jpg", b"page-two"),
+            ("__MACOSX/sub/._001.jpg", b"resource-fork"),
+            ("__MACOSX/sub/._002.jpg", b"resource-fork"),
+            (".DS_Store", b"junk"),
+        ]);
+
+        let result = read_archive_full(cbz.to_str().unwrap()).unwrap();
+        assert_eq!(result.page_count, 2, "only the two real pages are pages");
+        let expected = STANDARD.encode(b"REAL-COVER");
+        assert!(result.cover.unwrap().ends_with(&expected), "cover must be the real page");
+
+        // The count written into the file has to agree.
+        write_comic_info(cbz.to_str().unwrap(), ComicInfo::default()).unwrap();
+        let saved = read_comic_info(cbz.to_str().unwrap()).unwrap().unwrap();
+        assert_eq!(saved.page_count, Some(2));
+    }
+
+    /// Some archives nest the whole comic in a folder. The nested ComicInfo.xml
+    /// used to be ignored on open and then stranded on save beside a new root
+    /// copy, leaving two files disagreeing about the same comic.
+    #[test]
+    fn nested_comic_info_is_read_and_rewritten_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<ComicInfo><Series>Existing</Series><Summary>keep me</Summary></ComicInfo>"#;
+        let cbz = make_cbz(dir.path(), "s.cbz", &[
+            ("sub/001.jpg", b"x"),
+            ("sub/ComicInfo.xml", xml.as_bytes()),
+        ]);
+
+        // Read: the nested metadata is found, not silently replaced by guesses
+        // inferred from the filename.
+        let result = read_archive_full(cbz.to_str().unwrap()).unwrap();
+        assert_eq!(result.comic_info.series.as_deref(), Some("Existing"));
+        assert_eq!(result.comic_info.summary.as_deref(), Some("keep me"));
+
+        // Write: the same entry is updated, and no second copy appears.
+        write_comic_info(
+            cbz.to_str().unwrap(),
+            ComicInfo { series: Some("New".into()), ..Default::default() },
+        ).unwrap();
+
+        let names = entry_names(&cbz);
+        assert_eq!(
+            names.iter().filter(|n| n.to_lowercase().ends_with("comicinfo.xml")).count(),
+            1,
+            "exactly one metadata file, got: {:?}",
+            names
+        );
+        assert!(names.contains(&"sub/ComicInfo.xml".to_string()), "got: {:?}", names);
+        assert_eq!(read_comic_info(cbz.to_str().unwrap()).unwrap().unwrap().series.as_deref(), Some("New"));
+    }
+
+    /// A root ComicInfo.xml wins over a nested one, and the loser is removed
+    /// rather than left behind holding contradictory metadata.
+    #[test]
+    fn duplicate_comic_info_entries_are_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz = make_cbz(dir.path(), "d.cbz", &[
+            ("001.jpg", b"x"),
+            ("ComicInfo.xml", br#"<ComicInfo><Series>Root</Series></ComicInfo>"#),
+            ("sub/ComicInfo.xml", br#"<ComicInfo><Series>Nested</Series></ComicInfo>"#),
+        ]);
+
+        assert_eq!(
+            read_comic_info(cbz.to_str().unwrap()).unwrap().unwrap().series.as_deref(),
+            Some("Root"),
+            "the root file is canonical"
+        );
+
+        write_comic_info(
+            cbz.to_str().unwrap(),
+            ComicInfo { series: Some("Saved".into()), ..Default::default() },
+        ).unwrap();
+
+        let names = entry_names(&cbz);
+        assert_eq!(names, vec!["001.jpg".to_string(), "ComicInfo.xml".to_string()], "got: {:?}", names);
+    }
+
+    /// An off-spec enum value must not make the archive unopenable, and must
+    /// still be there after a save that does not touch it.
+    #[test]
+    fn archive_with_off_spec_metadata_opens_and_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = br#"<?xml version="1.0"?><ComicInfo><Series>S</Series><AgeRating>PG-13</AgeRating><Count/></ComicInfo>"#;
+        let cbz = make_cbz(dir.path(), "o.cbz", &[("001.jpg", b"x"), ("ComicInfo.xml", xml)]);
+
+        let opened = read_archive_full(cbz.to_str().unwrap()).expect("must open");
+        assert_eq!(opened.comic_info.series.as_deref(), Some("S"));
+
+        write_comic_info(cbz.to_str().unwrap(), opened.comic_info).unwrap();
+        let xml_out = String::from_utf8(read_entry(&cbz, "ComicInfo.xml")).unwrap();
+        assert!(xml_out.contains("<AgeRating>PG-13</AgeRating>"), "got: {}", xml_out);
+    }
+
+    #[test]
+    fn junk_entries_are_classified_consistently() {
+        assert!(is_page_entry("001.jpg"));
+        assert!(is_page_entry("sub/002.PNG"), "extension match is case-insensitive");
+        assert!(!is_page_entry("__MACOSX/sub/._001.jpg"));
+        assert!(!is_page_entry("sub/._001.jpg"));
+        assert!(!is_page_entry("ComicInfo.xml"));
+        assert!(!is_page_entry("sub/"), "directory entries are not pages");
+
+        assert!(is_comic_info_name("ComicInfo.xml"));
+        assert!(is_comic_info_name("sub/comicinfo.XML"));
+        assert!(!is_comic_info_name("MyComicInfo.xml"));
     }
 
     #[test]

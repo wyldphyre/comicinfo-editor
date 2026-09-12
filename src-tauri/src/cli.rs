@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::comicinfo::{AgeRating, ComicInfo, Manga, YesNo};
+use crate::comicinfo::{AgeRating, ComicInfo, Lenient, Manga, YesNo};
 use crate::filename_parser;
 
 pub struct CliArgs {
@@ -140,7 +140,7 @@ fn collect_files(cli: &CliArgs) -> Vec<PathBuf> {
         } else if path_str.contains('*') || path_str.contains('?') {
             if let Ok(entries) = glob::glob(path_str) {
                 for entry in entries.flatten() {
-                    if entry.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("cbz")) {
+                    if entry.is_file() && has_cbz_extension(&entry) {
                         files.push(entry);
                     }
                 }
@@ -148,7 +148,7 @@ fn collect_files(cli: &CliArgs) -> Vec<PathBuf> {
                 eprintln!("warning: invalid glob pattern: {}", path_str);
             }
         } else if p.exists() {
-            if p.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("cbz")) {
+            if has_cbz_extension(p) {
                 files.push(p.to_path_buf());
             } else {
                 eprintln!("warning: {} is not a CBZ file, skipping", path_str);
@@ -166,12 +166,23 @@ fn collect_from_dir(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() && recursive {
-            collect_from_dir(&path, recursive, files);
-        } else if path.extension().and_then(|e| e.to_str()).map_or(false, |e| e.eq_ignore_ascii_case("cbz")) {
+        // A *directory* named "Series.cbz" has a .cbz extension too. Testing
+        // the extension first queued it as a file, and the run then reported a
+        // bogus "Failed to read archive" against it.
+        if path.is_dir() {
+            if recursive {
+                collect_from_dir(&path, recursive, files);
+            }
+        } else if has_cbz_extension(&path) {
             files.push(path);
         }
     }
+}
+
+fn has_cbz_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cbz"))
 }
 
 fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
@@ -263,12 +274,12 @@ fn apply_field(info: &mut ComicInfo, name: &str, value: &str) -> Result<String, 
         "format" => { info.format = Some(value.into()); Ok(fmt_str("Format", value)) }
         "blackandwhite" | "black_and_white" | "bw" => {
             let v = parse_yes_no("BlackAndWhite", value)?;
-            info.black_and_white = Some(v);
+            info.black_and_white = Some(Lenient::Known(v));
             Ok(fmt_str("BlackAndWhite", value))
         }
         "manga" => {
             let v = parse_manga("Manga", value)?;
-            info.manga = Some(v);
+            info.manga = Some(Lenient::Known(v));
             Ok(fmt_str("Manga", value))
         }
         "characters" => { info.characters = Some(value.into()); Ok(fmt_str("Characters", value)) }
@@ -280,7 +291,7 @@ fn apply_field(info: &mut ComicInfo, name: &str, value: &str) -> Result<String, 
         "seriesgroup" | "series_group" => { info.series_group = Some(value.into()); Ok(fmt_str("SeriesGroup", value)) }
         "agerating" | "age_rating" => {
             let v = parse_age_rating("AgeRating", value)?;
-            info.age_rating = Some(v);
+            info.age_rating = Some(Lenient::Known(v));
             Ok(fmt_str("AgeRating", value))
         }
         "communityrating" | "community_rating" => {
@@ -465,6 +476,27 @@ mod tests {
         assert_eq!(name, "Web");
         assert_eq!(value, "https://example.com/?a=1");
         assert!(split_field_value("NoEquals").is_err());
+    }
+
+    /// A directory can be named "Series.cbz" too. Testing the extension before
+    /// the file type queued it as a file, and the run reported a bogus
+    /// "Failed to read archive" against it.
+    #[test]
+    fn a_directory_named_cbz_is_not_collected_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Series.cbz")).unwrap();
+        std::fs::write(dir.path().join("real.cbz"), b"not a real zip, just a file").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+
+        for recursive in [false, true] {
+            let mut found = Vec::new();
+            collect_from_dir(dir.path(), recursive, &mut found);
+            let names: Vec<String> = found
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(names, vec!["real.cbz".to_string()], "recursive: {}", recursive);
+        }
     }
 
     #[test]
