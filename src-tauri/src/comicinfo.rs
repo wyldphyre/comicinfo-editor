@@ -1,6 +1,10 @@
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IntoDeserializer, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
+use std::marker::PhantomData;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum YesNo {
@@ -64,6 +68,192 @@ impl Default for AgeRating {
     }
 }
 
+/// An enum-valued field that tolerates text the spec does not list.
+///
+/// Real files carry `PG-13` for AgeRating, `true` for BlackAndWhite, and other
+/// values no ComicInfo enum defines. Rejecting them failed the entire parse, so
+/// one stray word made the archive impossible to open at all. Mapping them to
+/// `None` instead would silently throw the value away, so `Other` keeps the
+/// original text and writes it back out unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Lenient<T> {
+    Known(T),
+    Other(String),
+}
+
+impl<T: Serialize> Serialize for Lenient<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Lenient::Known(value) => value.serialize(serializer),
+            Lenient::Other(raw) => serializer.serialize_str(raw),
+        }
+    }
+}
+
+/// Read an optional enum field. An absent or empty element is `None`; anything
+/// the enum does not define is kept verbatim as `Lenient::Other`.
+fn lenient_opt_enum<'de, D, T>(deserializer: D) -> Result<Option<Lenient<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let raw: Option<String> = Option::deserialize(deserializer)?;
+    let Some(raw) = raw else { return Ok(None) };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let as_str: de::value::StrDeserializer<de::value::Error> = trimmed.into_deserializer();
+    Ok(Some(match T::deserialize(as_str) {
+        Ok(value) => Lenient::Known(value),
+        Err(_) => Lenient::Other(raw),
+    }))
+}
+
+/// Read an optional number. Empty elements (`<Count/>`, `<Count></Count>`) are
+/// common in files written by other taggers and mean "absent", not "malformed";
+/// treating them as an error made the whole file unopenable. A value that is
+/// not a number at all is treated the same way, for the same reason.
+///
+/// Accepts both a string (how quick-xml hands us element text and attributes)
+/// and a real number (how the frontend's JSON payload sends it).
+fn lenient_opt_num<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+{
+    deserializer.deserialize_option(OptScalar::<T>(PhantomData))
+}
+
+/// Read an optional boolean, accepting the spellings other writers use
+/// (`True`, `TRUE`, `1`, `yes`) alongside the canonical `true`/`false`.
+fn lenient_opt_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_option(OptBool)
+}
+
+/// Turns whatever scalar form the value arrived in into a string, so a single
+/// `FromStr` parse covers quick-xml's text and serde_json's numbers alike.
+fn scalar_text<T: FromStr>(text: &str) -> Option<T> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<T>().ok()
+    }
+}
+
+struct OptScalar<T>(PhantomData<T>);
+
+impl<'de, T: FromStr> Visitor<'de> for OptScalar<T> {
+    type Value = Option<T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a number, or an empty value")
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(scalar_text(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(scalar_text(&value.to_string()))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(scalar_text(&value.to_string()))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(scalar_text(&value.to_string()))
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        Ok(element_text(map)?.as_deref().and_then(scalar_text))
+    }
+}
+
+/// The key quick-xml reports an element's own text content under.
+const XML_TEXT_KEY: &str = "$text";
+
+/// Pull an element's text out of the map form quick-xml hands to
+/// `deserialize_any`, ignoring any attributes or children. An element carrying
+/// nothing at all (`<Count/>`) is an empty map, i.e. an absent value.
+fn element_text<'de, A: de::MapAccess<'de>>(mut map: A) -> Result<Option<String>, A::Error> {
+    let mut text: Option<String> = None;
+    while let Some(key) = map.next_key::<String>()? {
+        if key == XML_TEXT_KEY {
+            text = Some(map.next_value::<String>()?);
+        } else {
+            map.next_value::<de::IgnoredAny>()?;
+        }
+    }
+    Ok(text)
+}
+
+struct OptBool;
+
+impl<'de> Visitor<'de> for OptBool {
+    type Value = Option<bool>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a boolean, or an empty value")
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Some(value))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Some(true),
+            "false" | "no" | "0" => Some(false),
+            _ => None,
+        })
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Some(value != 0))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(Some(value != 0))
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        match element_text(map)? {
+            Some(text) => self.visit_str(&text),
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename = "ComicInfo")]
 pub struct ComicInfo {
@@ -76,10 +266,20 @@ pub struct ComicInfo {
     #[serde(rename = "Number", skip_serializing_if = "Option::is_none")]
     pub number: Option<String>,
 
-    #[serde(rename = "Count", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Count",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub count: Option<i32>,
 
-    #[serde(rename = "Volume", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Volume",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub volume: Option<i32>,
 
     #[serde(rename = "AlternateSeries", skip_serializing_if = "Option::is_none")]
@@ -88,7 +288,12 @@ pub struct ComicInfo {
     #[serde(rename = "AlternateNumber", skip_serializing_if = "Option::is_none")]
     pub alternate_number: Option<String>,
 
-    #[serde(rename = "AlternateCount", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "AlternateCount",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub alternate_count: Option<i32>,
 
     #[serde(rename = "Summary", skip_serializing_if = "Option::is_none")]
@@ -97,13 +302,28 @@ pub struct ComicInfo {
     #[serde(rename = "Notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 
-    #[serde(rename = "Year", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Year",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub year: Option<i32>,
 
-    #[serde(rename = "Month", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Month",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub month: Option<i32>,
 
-    #[serde(rename = "Day", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Day",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub day: Option<i32>,
 
     #[serde(rename = "Writer", skip_serializing_if = "Option::is_none")]
@@ -145,7 +365,12 @@ pub struct ComicInfo {
     #[serde(rename = "Web", skip_serializing_if = "Option::is_none")]
     pub web: Option<String>,
 
-    #[serde(rename = "PageCount", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "PageCount",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub page_count: Option<i32>,
 
     #[serde(rename = "LanguageISO", skip_serializing_if = "Option::is_none")]
@@ -154,11 +379,21 @@ pub struct ComicInfo {
     #[serde(rename = "Format", skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
 
-    #[serde(rename = "BlackAndWhite", skip_serializing_if = "Option::is_none")]
-    pub black_and_white: Option<YesNo>,
+    #[serde(
+        rename = "BlackAndWhite",
+        default,
+        deserialize_with = "lenient_opt_enum",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub black_and_white: Option<Lenient<YesNo>>,
 
-    #[serde(rename = "Manga", skip_serializing_if = "Option::is_none")]
-    pub manga: Option<Manga>,
+    #[serde(
+        rename = "Manga",
+        default,
+        deserialize_with = "lenient_opt_enum",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub manga: Option<Lenient<Manga>>,
 
     #[serde(rename = "Characters", skip_serializing_if = "Option::is_none")]
     pub characters: Option<String>,
@@ -181,10 +416,20 @@ pub struct ComicInfo {
     #[serde(rename = "SeriesGroup", skip_serializing_if = "Option::is_none")]
     pub series_group: Option<String>,
 
-    #[serde(rename = "AgeRating", skip_serializing_if = "Option::is_none")]
-    pub age_rating: Option<AgeRating>,
+    #[serde(
+        rename = "AgeRating",
+        default,
+        deserialize_with = "lenient_opt_enum",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub age_rating: Option<Lenient<AgeRating>>,
 
-    #[serde(rename = "CommunityRating", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "CommunityRating",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub community_rating: Option<f64>,
 
     #[serde(rename = "MainCharacterOrTeam", skip_serializing_if = "Option::is_none")]
@@ -210,16 +455,31 @@ pub struct Pages {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Page {
-    #[serde(rename = "@Image", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "@Image",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image: Option<i32>,
 
     #[serde(rename = "@Type", skip_serializing_if = "Option::is_none")]
     pub page_type: Option<String>,
 
-    #[serde(rename = "@DoublePage", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "@DoublePage",
+        default,
+        deserialize_with = "lenient_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub double_page: Option<bool>,
 
-    #[serde(rename = "@ImageSize", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "@ImageSize",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_size: Option<i64>,
 
     #[serde(rename = "@Key", skip_serializing_if = "Option::is_none")]
@@ -228,10 +488,20 @@ pub struct Page {
     #[serde(rename = "@Bookmark", skip_serializing_if = "Option::is_none")]
     pub bookmark: Option<String>,
 
-    #[serde(rename = "@ImageWidth", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "@ImageWidth",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_width: Option<i32>,
 
-    #[serde(rename = "@ImageHeight", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "@ImageHeight",
+        default,
+        deserialize_with = "lenient_opt_num",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub image_height: Option<i32>,
 }
 
@@ -339,4 +609,75 @@ mod tests {
         assert_eq!(info.pages, reparsed.pages);
         assert_eq!(reparsed.pages.unwrap().pages.len(), 2);
     }
+
+    /// A value no ComicInfo enum lists must not fail the parse — one stray word
+    /// used to make the whole archive impossible to open. The original text is
+    /// kept so saving does not quietly rewrite it to something else.
+    #[test]
+    fn off_spec_enum_values_parse_and_round_trip() {
+        let xml = r#"<ComicInfo><Series>S</Series><AgeRating>PG-13</AgeRating><BlackAndWhite>true</BlackAndWhite></ComicInfo>"#;
+        let info = ComicInfo::from_xml(xml).expect("must not reject an off-spec enum value");
+        assert_eq!(info.age_rating, Some(Lenient::Other("PG-13".to_string())));
+        assert_eq!(info.black_and_white, Some(Lenient::Other("true".to_string())));
+
+        let out = info.to_xml().expect("serialize");
+        assert!(out.contains("<AgeRating>PG-13</AgeRating>"), "got: {}", out);
+        assert_eq!(ComicInfo::from_xml(&out).unwrap().age_rating, info.age_rating);
+    }
+
+    #[test]
+    fn spec_enum_values_still_parse_as_known() {
+        let xml = r#"<ComicInfo><AgeRating>Mature 17+</AgeRating><Manga>YesAndRightToLeft</Manga><BlackAndWhite>Yes</BlackAndWhite></ComicInfo>"#;
+        let info = ComicInfo::from_xml(xml).expect("parse");
+        assert_eq!(info.age_rating, Some(Lenient::Known(AgeRating::Mature17)));
+        assert_eq!(info.manga, Some(Lenient::Known(Manga::YesAndRightToLeft)));
+        assert_eq!(info.black_and_white, Some(Lenient::Known(YesNo::Yes)));
+        assert!(info.to_xml().unwrap().contains("<AgeRating>Mature 17+</AgeRating>"));
+    }
+
+    /// Other taggers write `<Count/>` and `<Count></Count>` for a field they
+    /// have no value for. Treating that as a malformed number rejected the file.
+    #[test]
+    fn empty_numeric_elements_are_absent_not_errors() {
+        let xml = r#"<ComicInfo><Series>S</Series><Count></Count><Volume/><Year> </Year><CommunityRating/></ComicInfo>"#;
+        let info = ComicInfo::from_xml(xml).expect("must not reject empty numeric elements");
+        assert_eq!(info.count, None);
+        assert_eq!(info.volume, None);
+        assert_eq!(info.year, None);
+        assert_eq!(info.community_rating, None);
+        assert_eq!(info.series.as_deref(), Some("S"));
+
+        // Real numbers, and the -1 unset sentinel, still come through.
+        let xml = r#"<ComicInfo><Count>12</Count><Volume>-1</Volume><CommunityRating>4.5</CommunityRating></ComicInfo>"#;
+        let info = ComicInfo::from_xml(xml).expect("parse");
+        assert_eq!((info.count, info.volume, info.community_rating), (Some(12), Some(-1), Some(4.5)));
+    }
+
+    /// `True`/`1` are how other writers spell a true boolean attribute.
+    #[test]
+    fn page_booleans_accept_other_spellings() {
+        for (raw, expected) in [("True", true), ("true", true), ("1", true), ("False", false), ("0", false)] {
+            let xml = format!(r#"<ComicInfo><Pages><Page Image="0" DoublePage="{}"/></Pages></ComicInfo>"#, raw);
+            let info = ComicInfo::from_xml(&xml).unwrap_or_else(|e| panic!("{} rejected: {}", raw, e));
+            assert_eq!(info.pages.unwrap().pages[0].double_page, Some(expected), "input: {}", raw);
+        }
+    }
+
+    /// The shape src/main.js sends on save must still deserialize, including a
+    /// non-standard enum value the form preserved in an injected <option>.
+    #[test]
+    fn frontend_json_payload_still_deserializes() {
+        let payload = r#"{"Title":"T","Year":2020,"Month":null,"Count":-1,
+            "CommunityRating":4.5,"AgeRating":"Mature 17+","BlackAndWhite":"Yes","Manga":null}"#;
+        let info: ComicInfo = serde_json::from_str(payload).expect("frontend payload");
+        assert_eq!(info.year, Some(2020));
+        assert_eq!(info.month, None);
+        assert_eq!(info.count, Some(-1));
+        assert_eq!(info.community_rating, Some(4.5));
+        assert_eq!(info.age_rating, Some(Lenient::Known(AgeRating::Mature17)));
+
+        let info: ComicInfo = serde_json::from_str(r#"{"AgeRating":"PG-13"}"#).unwrap();
+        assert!(info.to_xml().unwrap().contains("<AgeRating>PG-13</AgeRating>"));
+    }
 }
+

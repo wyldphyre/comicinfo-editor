@@ -14,6 +14,26 @@ let isPopulating = false;
 // to an i32 and must never be sent a fractional value.
 const DECIMAL_FIELDS = new Set(['community_rating']);
 
+// Bounds mirroring ComicInfo::validate for the fields that accept the schema's
+// -1 "unset" sentinel. Their inputs need min="-1" so -1 can be typed, which
+// also lets through values the backend rejects (0 is not a month) — an input's
+// min cannot express "either -1 or 1..12". Checking the real range here turns
+// what was a raw backend error into an inline message on the offending field.
+//
+// PageCount and CommunityRating are deliberately absent: they take no sentinel,
+// so their own min/max attributes already match the backend exactly.
+const FIELD_RANGES = {
+    year: { min: 1, max: 9999 },
+    month: { min: 1, max: 12 },
+    day: { min: 1, max: 31 },
+    count: { min: 0 },
+    volume: { min: 0 },
+    alternate_count: { min: 0 }
+};
+
+// The schema's "unset" value for the numeric fields that declare a default.
+const UNSET_SENTINEL = -1;
+
 // DOM elements
 const btnOpen = document.getElementById('btn-open');
 const btnSave = document.getElementById('btn-save');
@@ -82,16 +102,26 @@ window.addEventListener('DOMContentLoaded', async () => {
     setupButtons();
     setupDragDrop();
     setupDirtyTracking();
-    const version = await window.__TAURI__.app.getVersion();
-    document.getElementById('app-version').textContent = `v${version}`;
 
     // Register the listener and wait for the Rust event system to confirm it,
     // then tell the backend we're ready. The backend will immediately emit any
     // file that arrived via "Open With" before the frontend was loaded.
+    //
+    // This has to come before anything else that can reject: when the version
+    // lookup below ran first and threw, frontend_ready() was never called and
+    // an "Open With" launch sat there showing an empty editor for ever.
     await window.__TAURI__.event.listen('open-file', (event) => {
         handleFilePath(event.payload);
     });
     await invoke('frontend_ready');
+
+    try {
+        const version = await window.__TAURI__.app.getVersion();
+        document.getElementById('app-version').textContent = `v${version}`;
+    } catch (err) {
+        // Cosmetic only — never let it stop the editor from working.
+        console.error(err);
+    }
 });
 
 function setupTheme() {
@@ -367,15 +397,38 @@ async function saveFile() {
     }
 }
 
-/// First field whose value violates its own min/max/step constraints, or null.
+/// First field whose value the backend would reject, or null. Covers both the
+/// input's own min/max/step constraints and the ComicInfo ranges in
+/// FIELD_RANGES, which the inputs cannot express on their own.
 function findInvalidField() {
     for (const formId of Object.keys(fieldMap)) {
         const element = document.getElementById(formId);
-        if (!element || element.checkValidity()) continue;
+        if (!element) continue;
+
+        element.setCustomValidity(rangeError(formId, element) || '');
+        if (element.checkValidity()) continue;
+
         const label = document.querySelector(`label[for="${formId}"]`);
         return { element, labelText: label ? label.textContent : formId };
     }
     return null;
+}
+
+/// Message describing how a numeric field falls outside the ComicInfo range, or
+/// '' when it is fine. Blank means absent, and -1 is the schema's unset value.
+function rangeError(formId, element) {
+    const range = FIELD_RANGES[formId];
+    if (!range || element.value.trim() === '') return '';
+
+    const value = Number(element.value);
+    if (!Number.isFinite(value)) return 'Enter a number.';
+    if (value === UNSET_SENTINEL) return '';
+    if (value < range.min || (range.max !== undefined && value > range.max)) {
+        return range.max !== undefined
+            ? `Enter a value between ${range.min} and ${range.max} (or ${UNSET_SENTINEL} for unset).`
+            : `Enter ${range.min} or more (or ${UNSET_SENTINEL} for unset).`;
+    }
+    return '';
 }
 
 /// Bring a field into view: switch to its tab, focus it, and highlight it.
@@ -404,6 +457,7 @@ function populateForm(data) {
     try {
         // Clear form first
         form.reset();
+        clearNonStandardOptions();
 
         for (const [formId, dataKey] of Object.entries(fieldMap)) {
             const element = document.getElementById(formId);
@@ -419,8 +473,17 @@ function populateForm(data) {
             // Serde sends the YesNo/Manga/AgeRating enums as plain strings whose
             // text matches the corresponding <option value>. 'Unknown' has no
             // option of its own — it is the blank one at the top of each list.
-            if (element.tagName === 'SELECT' && value === 'Unknown') {
-                element.value = '';
+            if (element.tagName === 'SELECT') {
+                if (value === 'Unknown') {
+                    element.value = '';
+                } else {
+                    // The backend keeps enum text it does not recognise rather
+                    // than failing the whole file. Give it an option of its own
+                    // so it stays visible and survives the next save instead of
+                    // being silently dropped by a select that cannot show it.
+                    addNonStandardOption(element, value);
+                    element.value = value;
+                }
             } else {
                 element.value = value;
             }
@@ -428,6 +491,23 @@ function populateForm(data) {
     } finally {
         isPopulating = false;
     }
+}
+
+/// Drop the options a previous file's off-spec values added. form.reset() only
+/// restores selections, so without this they accumulate across opens.
+function clearNonStandardOptions() {
+    document.querySelectorAll('option[data-non-standard]').forEach(option => option.remove());
+}
+
+/// Add `value` to a select that has no option for it, flagged so the user can
+/// see it is not one of the spec's values.
+function addNonStandardOption(select, value) {
+    if (Array.from(select.options).some(option => option.value === value)) return;
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = `${value} (not in spec)`;
+    option.dataset.nonStandard = 'true';
+    select.append(option);
 }
 
 function collectFormData() {

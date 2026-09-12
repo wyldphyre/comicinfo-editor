@@ -111,7 +111,12 @@ Binaries output to `src-tauri/target/release/bundle/`
 ## Technical Notes
 
 - CBZ files are ZIP archives with .cbz extension
-- ComicInfo.xml is stored at the root of the archive
+- ComicInfo.xml belongs at the root, but `find_comic_info` also accepts one
+  nested in a folder (shallowest wins) and rewrites it in place; a save
+  collapses any duplicate copies so readers can't disagree about which applies
+- `is_page_entry` is the single definition of "a page": an image extension that
+  is not OS junk. AppleDouble forks (`__MACOSX/`, `._name.jpg`) must stay
+  excluded from both PageCount and cover selection
 - The app preserves other files in the archive when saving
 - XML field names use PascalCase (e.g., "AlternateSeries")
 - Serde renames are used for XML compatibility, affecting JSON keys sent to frontend
@@ -120,7 +125,14 @@ Binaries output to `src-tauri/target/release/bundle/`
 - Saves go to a temp file that is fsync'd and renamed, so an interrupted write
   cannot leave a truncated archive in place of the original
 - Numeric fields use -1 as the schema's "unset" sentinel; `ComicInfo::validate`
-  accepts it and is the single bounds check for both the GUI and CLI paths
+  is the authoritative bounds check for both the GUI and CLI paths. The inputs
+  need `min="-1"` to let the sentinel be typed, which no `min` can reconcile
+  with "1..12" — so `FIELD_RANGES` in main.js mirrors those bounds to report a
+  bad value inline instead of as a raw backend error
+- Parsing is deliberately lenient: an enum value the spec doesn't list is kept
+  verbatim as `Lenient::Other`, and an empty or unparseable numeric element
+  reads as absent. Being strict meant one stray value made a whole archive
+  impossible to open. `Web` is a plain text input for the same reason
 - "Open With" arrives via `RunEvent::Opened` on macOS and via argv elsewhere;
   `tauri-plugin-single-instance` routes a second launch into the running window
 
