@@ -82,11 +82,12 @@ The app binary can be run directly from the terminal to process multiple files w
 | Option | Description |
 |--------|-------------|
 | `--infer` | Fill **missing** metadata fields inferred from the filename (non-destructive) |
+| `--convert` | Convert CBR/RAR and CB7/7z archives to CBZ next to the original (which is kept). Skips any whose `.cbz` already exists. RAR needs `unar` |
 | `--set Field=Value` | Set a specific field on every matched file (repeatable, always overwrites) |
 | `--recursive`, `-r` | Scan folders recursively (default: non-recursive) |
 | `--help`, `-h` | Show help and a full list of settable fields |
 
-`PATH` can be a folder, a quoted glob pattern, or individual `.cbz` files.
+`PATH` can be a folder, a quoted glob pattern, or individual `.cbz` files (plus `.cbr`/`.rar`/`.cb7`/`.7z` with `--convert`). When `--convert` is combined with `--infer`/`--set`, the edits are applied to the newly converted CBZ.
 
 ### Examples
 
@@ -102,6 +103,9 @@ comicinfo-editor --infer --set Series="My Series" /path/to/comics/
 
 # Use a quoted glob pattern
 comicinfo-editor --set Publisher="Viz" "/Volumes/Comics/Naruto/*.cbz"
+
+# Convert all CBR/CB7 archives in a folder to CBZ, filling metadata from filenames
+comicinfo-editor --convert --infer /path/to/comics/
 
 # Scan recursively
 comicinfo-editor --infer --recursive /path/to/comics/

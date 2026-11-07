@@ -5,6 +5,7 @@ use crate::filename_parser;
 
 pub struct CliArgs {
     pub infer: bool,
+    pub convert: bool,
     pub set_fields: Vec<(String, String)>,
     pub recursive: bool,
     pub paths: Vec<String>,
@@ -14,7 +15,7 @@ pub struct CliArgs {
 pub fn is_cli_mode(args: &[String]) -> bool {
     args.iter()
         .skip(1)
-        .any(|a| a == "--infer" || a.starts_with("--set") || a == "--help" || a == "-h")
+        .any(|a| a == "--infer" || a == "--convert" || a.starts_with("--set") || a == "--help" || a == "-h")
 }
 
 pub fn run(args_vec: Vec<String>) -> i32 {
@@ -40,10 +41,23 @@ pub fn run(args_vec: Vec<String>) -> i32 {
         }
     }
 
-    let files = collect_files(&cli);
+    let edits_metadata = cli.infer || !cli.set_fields.is_empty();
+
+    let mut files = collect_files(&cli);
+    // With --convert alone there is nothing to do to a file that is already a
+    // CBZ; listing it would only report a bogus "converted: X -> X".
+    if !edits_metadata {
+        files.retain(|f| is_convertible(f));
+    }
 
     if files.is_empty() {
-        eprintln!("No CBZ files found matching the given paths.");
+        if !edits_metadata {
+            eprintln!("No CBR/RAR or CB7/7z files found matching the given paths.");
+        } else if cli.convert {
+            eprintln!("No CBZ, CBR/RAR or CB7/7z files found matching the given paths.");
+        } else {
+            eprintln!("No CBZ files found matching the given paths.");
+        }
         return 1;
     }
 
@@ -52,17 +66,51 @@ pub fn run(args_vec: Vec<String>) -> i32 {
     let mut errors = 0usize;
 
     for file in &files {
-        match process_file(file, &cli) {
+        // Non-CBZ archives are only collected under --convert. Convert first,
+        // then run any metadata edits against the new CBZ.
+        let (target, converted) = if is_convertible(file) {
+            let dest = file.with_extension("cbz");
+            // Never overwrite: the existing CBZ may hold edits the source
+            // lacks. Treating this as a skip keeps re-runs over a folder clean.
+            if dest.exists() {
+                println!("skipped:   {} ({} already exists)", file.display(), dest.display());
+                skipped += 1;
+                continue;
+            }
+            match convert_file(file, &dest) {
+                Ok(()) => (dest, true),
+                Err(e) => {
+                    eprintln!("error:     {}: {}", file.display(), e);
+                    errors += 1;
+                    continue;
+                }
+            }
+        } else {
+            (file.clone(), false)
+        };
+
+        if !edits_metadata {
+            println!("converted: {} -> {}", file.display(), target.display());
+            processed += 1;
+            continue;
+        }
+
+        let prefix = if converted { format!("converted from {}; ", file.display()) } else { String::new() };
+        match process_file(&target, &cli) {
             Ok(Some(summary)) => {
-                println!("processed: {} ({})", file.display(), summary);
+                println!("processed: {} ({}{})", target.display(), prefix, summary);
+                processed += 1;
+            }
+            Ok(None) if converted => {
+                println!("processed: {} ({}no metadata changes)", target.display(), prefix);
                 processed += 1;
             }
             Ok(None) => {
-                println!("skipped:   {} (no changes)", file.display());
+                println!("skipped:   {} (no changes)", target.display());
                 skipped += 1;
             }
             Err(e) => {
-                eprintln!("error:     {}: {}", file.display(), e);
+                eprintln!("error:     {}: {}{}", target.display(), prefix, e);
                 errors += 1;
             }
         }
@@ -76,6 +124,7 @@ pub fn run(args_vec: Vec<String>) -> i32 {
 fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
     let mut cli = CliArgs {
         infer: false,
+        convert: false,
         set_fields: Vec::new(),
         recursive: false,
         paths: Vec::new(),
@@ -91,6 +140,7 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
                 std::process::exit(0);
             }
             "--infer" => cli.infer = true,
+            "--convert" => cli.convert = true,
             "--recursive" | "-r" => cli.recursive = true,
             "--set" => {
                 i += 1;
@@ -112,15 +162,40 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
         i += 1;
     }
 
-    if !cli.infer && cli.set_fields.is_empty() {
-        return Err("No operation specified. Use --infer and/or --set Field=Value.".to_string());
+    if !cli.infer && !cli.convert && cli.set_fields.is_empty() {
+        return Err("No operation specified. Use --infer, --convert and/or --set Field=Value.".to_string());
     }
 
     if cli.paths.is_empty() {
         return Err("No paths specified.".to_string());
     }
 
+    // "--set A=1 B=2" reads B=2 as a path. It then only drew a "not found"
+    // warning mid-run, so the field was silently dropped while the run went
+    // ahead and edited every file without it.
+    for path in &cli.paths {
+        if let Some(field) = misplaced_set_field(path) {
+            return Err(format!(
+                "'{}' looks like a field assignment, not a path. Each field needs its own --set: --set {}",
+                path, field
+            ));
+        }
+    }
+
     Ok(cli)
+}
+
+/// Returns the argument when it is `Field=Value` for a known field and does not
+/// exist on disk (a real file named like that is still treated as a path).
+fn misplaced_set_field(arg: &str) -> Option<&str> {
+    if Path::new(arg).exists() {
+        return None;
+    }
+    let (name, value) = split_field_value(arg).ok()?;
+    match apply_field(&mut ComicInfo::default(), &name, &value) {
+        Err(e) if e.starts_with("Unknown field") => None,
+        _ => Some(arg),
+    }
 }
 
 fn split_field_value(s: &str) -> Result<(String, String), String> {
@@ -136,11 +211,11 @@ fn collect_files(cli: &CliArgs) -> Vec<PathBuf> {
     for path_str in &cli.paths {
         let p = Path::new(path_str);
         if p.is_dir() {
-            collect_from_dir(p, cli.recursive, &mut files);
+            collect_from_dir(p, cli.recursive, cli.convert, &mut files);
         } else if path_str.contains('*') || path_str.contains('?') {
             if let Ok(entries) = glob::glob(path_str) {
                 for entry in entries.flatten() {
-                    if entry.is_file() && has_cbz_extension(&entry) {
+                    if entry.is_file() && is_wanted(&entry, cli.convert) {
                         files.push(entry);
                     }
                 }
@@ -148,8 +223,10 @@ fn collect_files(cli: &CliArgs) -> Vec<PathBuf> {
                 eprintln!("warning: invalid glob pattern: {}", path_str);
             }
         } else if p.exists() {
-            if has_cbz_extension(p) {
+            if is_wanted(p, cli.convert) {
                 files.push(p.to_path_buf());
+            } else if is_convertible(p) {
+                eprintln!("warning: {} is not a CBZ file, skipping (use --convert to convert it)", path_str);
             } else {
                 eprintln!("warning: {} is not a CBZ file, skipping", path_str);
             }
@@ -162,7 +239,7 @@ fn collect_files(cli: &CliArgs) -> Vec<PathBuf> {
     files
 }
 
-fn collect_from_dir(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) {
+fn collect_from_dir(dir: &Path, recursive: bool, convert: bool, files: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -171,9 +248,9 @@ fn collect_from_dir(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) {
         // bogus "Failed to read archive" against it.
         if path.is_dir() {
             if recursive {
-                collect_from_dir(&path, recursive, files);
+                collect_from_dir(&path, recursive, convert, files);
             }
-        } else if has_cbz_extension(&path) {
+        } else if is_wanted(&path, convert) {
             files.push(path);
         }
     }
@@ -183,6 +260,23 @@ fn has_cbz_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("cbz"))
+}
+
+/// Archive formats `--convert` turns into CBZ — the same set the GUI offers.
+fn is_convertible(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["cbr", "rar", "cb7", "7z"].iter().any(|c| e.eq_ignore_ascii_case(c)))
+}
+
+fn is_wanted(path: &Path, convert: bool) -> bool {
+    has_cbz_extension(path) || (convert && is_convertible(path))
+}
+
+fn convert_file(source: &Path, dest: &Path) -> Result<(), String> {
+    let source_str = source.to_str().ok_or_else(|| "path is not valid UTF-8".to_string())?;
+    let dest_str = dest.to_str().ok_or_else(|| "path is not valid UTF-8".to_string())?;
+    crate::convert_to_cbz_blocking(source_str, Some(dest_str.to_string())).map(|_| ())
 }
 
 fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
@@ -368,11 +462,16 @@ fn usage() -> String {
 
 Options:
   --infer              Fill missing metadata fields inferred from the filename
+  --convert            Convert CBR/RAR and CB7/7z archives to CBZ alongside the
+                       original (kept). Skipped if the .cbz already exists.
+                       Combine with --infer/--set to edit the new CBZ.
+                       RAR conversion requires unar.
   --set Field=Value    Set a specific metadata field (repeatable)
   --recursive, -r      Scan folders recursively (default: non-recursive)
   --help, -h           Show this help
 
-PATH can be a folder, a glob pattern (quoted), or individual .cbz files.
+PATH can be a folder, a glob pattern (quoted), or individual .cbz files
+(plus .cbr/.rar/.cb7/.7z files with --convert).
 
 Fields for --set:
   String:  Series, Title, Number, AlternateSeries, AlternateNumber, Summary,
@@ -397,6 +496,9 @@ Examples:
 
   # Infer, then override the series name
   comicinfo-editor --infer --set Series=\"Override\" /path/to/comics/
+
+  # Convert every CBR/CB7 in a folder to CBZ, filling metadata from filenames
+  comicinfo-editor --convert --infer /path/to/comics/
 
   # Use a glob pattern (quote it to prevent shell expansion)
   comicinfo-editor --set Publisher=\"Viz\" \"/Volumes/Comics/**/*.cbz\" --recursive
@@ -490,13 +592,56 @@ mod tests {
 
         for recursive in [false, true] {
             let mut found = Vec::new();
-            collect_from_dir(dir.path(), recursive, &mut found);
+            collect_from_dir(dir.path(), recursive, false, &mut found);
             let names: Vec<String> = found
                 .iter()
                 .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
                 .collect();
             assert_eq!(names, vec!["real.cbz".to_string()], "recursive: {}", recursive);
         }
+    }
+
+    #[test]
+    fn convertible_archives_are_collected_only_with_convert() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.cbz", "b.cbr", "c.RAR", "d.cb7", "e.7z", "f.zip", "g.txt"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let names = |convert: bool| {
+            let mut found = Vec::new();
+            collect_from_dir(dir.path(), false, convert, &mut found);
+            let mut names: Vec<String> = found
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(false), vec!["a.cbz"]);
+        assert_eq!(names(true), vec!["a.cbz", "b.cbr", "c.RAR", "d.cb7", "e.7z"]);
+    }
+
+    #[test]
+    fn convert_alone_is_a_valid_operation() {
+        let args = ["comicinfo-editor", "--convert", "x.cbr"].map(String::from).to_vec();
+        assert!(is_cli_mode(&args));
+        let cli = parse_args(args).unwrap();
+        assert!(cli.convert && !cli.infer && cli.set_fields.is_empty());
+    }
+
+    #[test]
+    fn field_assignment_without_set_is_rejected() {
+        let args = ["comicinfo-editor", "--set", "Series=X", "Manga=YesAndRightToLeft", "comics"]
+            .map(String::from)
+            .to_vec();
+        let err = parse_args(args).err().expect("should be rejected");
+        assert!(err.contains("--set Manga=YesAndRightToLeft"), "got: {}", err);
+
+        // An invalid value for a known field is still clearly a misplaced --set.
+        assert!(misplaced_set_field("Year=abc").is_some());
+        // Not a known field: leave it as an ordinary (missing) path.
+        assert!(misplaced_set_field("draft=v2").is_none());
+        assert!(misplaced_set_field("comics").is_none());
     }
 
     #[test]

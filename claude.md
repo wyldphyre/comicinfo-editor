@@ -43,7 +43,7 @@ comicinfo-editor/
 - Loading spinner during operations
 - CBR/RAR and 7z/CB7 to CBZ conversion (prompts user before converting)
 - Unsaved-changes prompt before opening another file or closing the window
-- Batch CLI mode: `--infer` and `--set Field=Value` (see `--help`)
+- Batch CLI mode: `--infer`, `--set Field=Value` and `--convert` (see `--help`)
 
 ### UI Features
 - Dark and light themes with toggle button (persisted in localStorage)
