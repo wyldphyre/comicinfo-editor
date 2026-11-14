@@ -6,7 +6,7 @@ A cross-platform desktop application for editing ComicInfo.xml metadata in CBZ c
 
 - **Full ComicInfo v2.1 Support** - Edit all metadata fields including title, series, credits, ratings, and more
 - **Filename Inference** - When opening a file with no embedded metadata, automatically extracts series, volume, issue number, year, and artist from the filename
-- **CLI Batch Mode** - Process multiple files from the command line: infer metadata from filenames or set fields across a whole folder
+- **CLI Batch Mode** - Process multiple files from the command line: read metadata (text or JSON), infer it from filenames, or set and clear fields across a whole folder
 - **Cover Preview** - Displays the cover image from the CBZ archive
 - **Drag & Drop** - Drop CBZ files directly onto the app to open them
 - **Format Conversion** - Open CBR/RAR and 7z/CB7 files and convert them to CBZ automatically
@@ -81,9 +81,12 @@ The app binary can be run directly from the terminal to process multiple files w
 
 | Option | Description |
 |--------|-------------|
+| `--read` | Print each file's metadata. Read-only, so it can't be combined with the options that change files |
+| `--json` | With `--read`, output a JSON array (`path`, `metadata`, and `error` when a file couldn't be read) |
 | `--infer` | Fill **missing** metadata fields inferred from the filename (non-destructive) |
 | `--convert` | Convert CBR/RAR and CB7/7z archives to CBZ next to the original (which is kept). Skips any whose `.cbz` already exists. RAR needs `unar` |
 | `--set Field=Value` | Set a specific field on every matched file (repeatable, always overwrites) |
+| `--clear Field` | Remove a field entirely (repeatable). Applied after `--infer` and `--set`. A cleared PageCount is recounted from the archive |
 | `--recursive`, `-r` | Scan folders recursively (default: non-recursive) |
 | `--help`, `-h` | Show help and a full list of settable fields |
 
@@ -92,6 +95,9 @@ The app binary can be run directly from the terminal to process multiple files w
 ### Examples
 
 ```bash
+# Show the metadata of every CBZ in a folder (add --json for machine-readable output)
+comicinfo-editor --read /path/to/comics/
+
 # Infer metadata from filenames for all CBZ files in a folder
 comicinfo-editor --infer /path/to/comics/
 
@@ -104,6 +110,9 @@ comicinfo-editor --infer --set Series="My Series" /path/to/comics/
 # Use a quoted glob pattern
 comicinfo-editor --set Publisher="Viz" "/Volumes/Comics/Naruto/*.cbz"
 
+# Remove fields from every file
+comicinfo-editor --clear Tags --clear Review /path/to/comics/
+
 # Convert all CBR/CB7 archives in a folder to CBZ, filling metadata from filenames
 comicinfo-editor --convert --infer /path/to/comics/
 
@@ -111,7 +120,7 @@ comicinfo-editor --convert --infer /path/to/comics/
 comicinfo-editor --infer --recursive /path/to/comics/
 ```
 
-Output prints one line per file showing what changed, errors go to stderr, and a summary line at the end.
+When editing, output prints one line per file showing what changed, errors go to stderr, and a summary line at the end. `--read` prints only the metadata (or JSON), with read errors on stderr.
 
 ## Supported Fields
 
