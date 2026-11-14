@@ -20,7 +20,7 @@ comicinfo-editor/
 │   ├── src/
 │   │   ├── main.rs         # Entry point (GUI vs CLI dispatch)
 │   │   ├── lib.rs          # Tauri commands & archive read/write
-│   │   ├── cli.rs          # Batch mode (--infer / --set)
+│   │   ├── cli.rs          # Batch mode (--read / --infer / --set / --clear / --convert)
 │   │   ├── filename_parser.rs  # Metadata inference from filenames
 │   │   └── comicinfo.rs    # ComicInfo struct, XML handling, validation
 │   ├── Cargo.toml          # Rust dependencies
@@ -43,7 +43,7 @@ comicinfo-editor/
 - Loading spinner during operations
 - CBR/RAR and 7z/CB7 to CBZ conversion (prompts user before converting)
 - Unsaved-changes prompt before opening another file or closing the window
-- Batch CLI mode: `--infer`, `--set Field=Value` and `--convert` (see `--help`)
+- Batch CLI mode: `--read [--json]`, `--infer`, `--set Field=Value`, `--clear Field` and `--convert` (see `--help`)
 
 ### UI Features
 - Dark and light themes with toggle button (persisted in localStorage)
@@ -133,6 +133,9 @@ Binaries output to `src-tauri/target/release/bundle/`
   verbatim as `Lenient::Other`, and an empty or unparseable numeric element
   reads as absent. Being strict meant one stray value made a whole archive
   impossible to open. `Web` is a plain text input for the same reason
+- `FIELDS` in cli.rs (schema order) drives `--read` output, `--clear` and
+  field-name resolution for `--set`; a test fails if it drifts from the
+  `ComicInfo` struct, so add new fields there too
 - "Open With" arrives via `RunEvent::Opened` on macOS and via argv elsewhere;
   `tauri-plugin-single-instance` routes a second launch into the running window
 

@@ -7,6 +7,10 @@ pub struct CliArgs {
     pub infer: bool,
     pub convert: bool,
     pub set_fields: Vec<(String, String)>,
+    /// Canonical field names (already resolved by `resolve_field`).
+    pub clear_fields: Vec<&'static str>,
+    pub read: bool,
+    pub json: bool,
     pub recursive: bool,
     pub paths: Vec<String>,
 }
@@ -15,7 +19,15 @@ pub struct CliArgs {
 pub fn is_cli_mode(args: &[String]) -> bool {
     args.iter()
         .skip(1)
-        .any(|a| a == "--infer" || a == "--convert" || a.starts_with("--set") || a == "--help" || a == "-h")
+        .any(|a| {
+            a == "--infer"
+                || a == "--convert"
+                || a == "--read"
+                || a.starts_with("--set")
+                || a.starts_with("--clear")
+                || a == "--help"
+                || a == "-h"
+        })
 }
 
 pub fn run(args_vec: Vec<String>) -> i32 {
@@ -27,6 +39,10 @@ pub fn run(args_vec: Vec<String>) -> i32 {
             return 1;
         }
     };
+
+    if cli.read {
+        return run_read(&cli);
+    }
 
     // Check every --set name and value against a throwaway record first. A typo
     // would otherwise fail identically on every file in the batch, after the
@@ -41,7 +57,7 @@ pub fn run(args_vec: Vec<String>) -> i32 {
         }
     }
 
-    let edits_metadata = cli.infer || !cli.set_fields.is_empty();
+    let edits_metadata = cli.infer || !cli.set_fields.is_empty() || !cli.clear_fields.is_empty();
 
     let mut files = collect_files(&cli);
     // With --convert alone there is nothing to do to a file that is already a
@@ -126,6 +142,9 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
         infer: false,
         convert: false,
         set_fields: Vec::new(),
+        clear_fields: Vec::new(),
+        read: false,
+        json: false,
         recursive: false,
         paths: Vec::new(),
     };
@@ -142,6 +161,18 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
             "--infer" => cli.infer = true,
             "--convert" => cli.convert = true,
             "--recursive" | "-r" => cli.recursive = true,
+            "--read" => cli.read = true,
+            "--json" => cli.json = true,
+            "--clear" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--clear requires a field name".to_string());
+                }
+                push_clear(&mut cli, &args[i])?;
+            }
+            arg if arg.starts_with("--clear=") => {
+                push_clear(&mut cli, &arg["--clear=".len()..])?;
+            }
             "--set" => {
                 i += 1;
                 if i >= args.len() {
@@ -162,8 +193,24 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
         i += 1;
     }
 
-    if !cli.infer && !cli.convert && cli.set_fields.is_empty() {
-        return Err("No operation specified. Use --infer, --convert and/or --set Field=Value.".to_string());
+    let edits = cli.infer || cli.convert || !cli.set_fields.is_empty() || !cli.clear_fields.is_empty();
+    if cli.read && edits {
+        return Err("--read only reads; it cannot be combined with --infer, --set, --clear or --convert.".to_string());
+    }
+    if cli.json && !cli.read {
+        return Err("--json only applies to --read.".to_string());
+    }
+    if !cli.read && !edits {
+        return Err("No operation specified. Use --read, --infer, --convert, --set Field=Value and/or --clear Field.".to_string());
+    }
+
+    // Setting and clearing the same field in one run has no sensible meaning.
+    for (name, _) in &cli.set_fields {
+        if let Some(field) = resolve_field(name) {
+            if cli.clear_fields.contains(&field) {
+                return Err(format!("{} is both set and cleared; use one or the other.", field));
+            }
+        }
     }
 
     if cli.paths.is_empty() {
@@ -180,9 +227,26 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs, String> {
                 path, field
             ));
         }
+        // Same mistake with "--clear A B": B becomes a path.
+        if !cli.clear_fields.is_empty() && !Path::new(path).exists() {
+            if let Some(field) = resolve_field(path) {
+                return Err(format!(
+                    "'{}' looks like a field name, not a path. Each field needs its own --clear: --clear {}",
+                    path, field
+                ));
+            }
+        }
     }
 
     Ok(cli)
+}
+
+fn push_clear(cli: &mut CliArgs, name: &str) -> Result<(), String> {
+    let field = resolve_field(name).ok_or_else(|| unknown_field(name))?;
+    if !cli.clear_fields.contains(&field) {
+        cli.clear_fields.push(field);
+    }
+    Ok(())
 }
 
 /// Returns the argument when it is `Field=Value` for a known field and does not
@@ -191,11 +255,8 @@ fn misplaced_set_field(arg: &str) -> Option<&str> {
     if Path::new(arg).exists() {
         return None;
     }
-    let (name, value) = split_field_value(arg).ok()?;
-    match apply_field(&mut ComicInfo::default(), &name, &value) {
-        Err(e) if e.starts_with("Unknown field") => None,
-        _ => Some(arg),
-    }
+    let (name, _) = split_field_value(arg).ok()?;
+    resolve_field(&name).map(|_| arg)
 }
 
 fn split_field_value(s: &str) -> Result<(String, String), String> {
@@ -327,6 +388,14 @@ fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
         changes.push(apply_field(&mut info, name, value)?);
     }
 
+    // Clearing runs last so it also removes anything --infer just filled.
+    // Clearing a field the file doesn't have is not a change.
+    for field in &cli.clear_fields {
+        if clear_field(&mut info, field) {
+            changes.push(format!("cleared {}", field));
+        }
+    }
+
     if changes.is_empty() {
         return Ok(None);
     }
@@ -335,68 +404,275 @@ fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
     Ok(Some(changes.join(", ")))
 }
 
+/// Every settable field, in ComicInfo schema order (the order `--read` prints).
+const FIELDS: &[&str] = &[
+    "Title",
+    "Series",
+    "Number",
+    "Count",
+    "Volume",
+    "AlternateSeries",
+    "AlternateNumber",
+    "AlternateCount",
+    "Summary",
+    "Notes",
+    "Year",
+    "Month",
+    "Day",
+    "Writer",
+    "Penciller",
+    "Inker",
+    "Colorist",
+    "Letterer",
+    "CoverArtist",
+    "Editor",
+    "Translator",
+    "Publisher",
+    "Imprint",
+    "Genre",
+    "Tags",
+    "Web",
+    "PageCount",
+    "LanguageISO",
+    "Format",
+    "BlackAndWhite",
+    "Manga",
+    "Characters",
+    "Teams",
+    "Locations",
+    "ScanInformation",
+    "StoryArc",
+    "StoryArcNumber",
+    "SeriesGroup",
+    "AgeRating",
+    "CommunityRating",
+    "MainCharacterOrTeam",
+    "Review",
+    "GTIN",
+];
+
+fn unknown_field(name: &str) -> String {
+    format!("Unknown field: '{}'. Run --help for a list of valid fields.", name)
+}
+
+/// Map a user-supplied field name to its canonical spelling. Matching ignores
+/// case and underscores, so "CoverArtist", "coverartist" and "cover_artist" are
+/// all accepted; "bw" and "language" are kept as historical shorthands.
+fn resolve_field(name: &str) -> Option<&'static str> {
+    let key = name.replace('_', "");
+    if key.eq_ignore_ascii_case("bw") {
+        return Some("BlackAndWhite");
+    }
+    if key.eq_ignore_ascii_case("language") {
+        return Some("LanguageISO");
+    }
+    FIELDS.iter().copied().find(|f| f.eq_ignore_ascii_case(&key))
+}
+
+/// Remove a field entirely (the element is dropped from the XML). Returns
+/// whether it was present. Takes a canonical name from `resolve_field`.
+fn clear_field(info: &mut ComicInfo, field: &str) -> bool {
+    match field {
+        "Title" => info.title.take().is_some(),
+        "Series" => info.series.take().is_some(),
+        "Number" => info.number.take().is_some(),
+        "Count" => info.count.take().is_some(),
+        "Volume" => info.volume.take().is_some(),
+        "AlternateSeries" => info.alternate_series.take().is_some(),
+        "AlternateNumber" => info.alternate_number.take().is_some(),
+        "AlternateCount" => info.alternate_count.take().is_some(),
+        "Summary" => info.summary.take().is_some(),
+        "Notes" => info.notes.take().is_some(),
+        "Year" => info.year.take().is_some(),
+        "Month" => info.month.take().is_some(),
+        "Day" => info.day.take().is_some(),
+        "Writer" => info.writer.take().is_some(),
+        "Penciller" => info.penciller.take().is_some(),
+        "Inker" => info.inker.take().is_some(),
+        "Colorist" => info.colorist.take().is_some(),
+        "Letterer" => info.letterer.take().is_some(),
+        "CoverArtist" => info.cover_artist.take().is_some(),
+        "Editor" => info.editor.take().is_some(),
+        "Translator" => info.translator.take().is_some(),
+        "Publisher" => info.publisher.take().is_some(),
+        "Imprint" => info.imprint.take().is_some(),
+        "Genre" => info.genre.take().is_some(),
+        "Tags" => info.tags.take().is_some(),
+        "Web" => info.web.take().is_some(),
+        "PageCount" => info.page_count.take().is_some(),
+        "LanguageISO" => info.language_iso.take().is_some(),
+        "Format" => info.format.take().is_some(),
+        "BlackAndWhite" => info.black_and_white.take().is_some(),
+        "Manga" => info.manga.take().is_some(),
+        "Characters" => info.characters.take().is_some(),
+        "Teams" => info.teams.take().is_some(),
+        "Locations" => info.locations.take().is_some(),
+        "ScanInformation" => info.scan_information.take().is_some(),
+        "StoryArc" => info.story_arc.take().is_some(),
+        "StoryArcNumber" => info.story_arc_number.take().is_some(),
+        "SeriesGroup" => info.series_group.take().is_some(),
+        "AgeRating" => info.age_rating.take().is_some(),
+        "CommunityRating" => info.community_rating.take().is_some(),
+        "MainCharacterOrTeam" => info.main_character_or_team.take().is_some(),
+        "Review" => info.review.take().is_some(),
+        "GTIN" => info.gtin.take().is_some(),
+        _ => unreachable!("resolve_field returned unhandled field {}", field),
+    }
+}
+
+/// One file's entry in `--read --json` output. `metadata` is null both when
+/// the archive has no ComicInfo.xml and when it could not be read; `error` is
+/// present only in the second case.
+#[derive(serde::Serialize)]
+struct ReadRecord {
+    path: String,
+    metadata: Option<ComicInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn run_read(cli: &CliArgs) -> i32 {
+    let files = collect_files(cli);
+    if files.is_empty() {
+        eprintln!("No CBZ files found matching the given paths.");
+        return 1;
+    }
+
+    let mut errors = 0usize;
+    let mut records = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let path = file.to_string_lossy().to_string();
+        let result = file
+            .to_str()
+            .ok_or_else(|| "path is not valid UTF-8".to_string())
+            .and_then(crate::read_comic_info);
+        if let Err(e) = &result {
+            eprintln!("error:     {}: {}", path, e);
+            errors += 1;
+        }
+        if cli.json {
+            let (metadata, error) = match result {
+                Ok(info) => (info, None),
+                Err(e) => (None, Some(e)),
+            };
+            records.push(ReadRecord { path, metadata, error });
+        } else if let Ok(info) = result {
+            if i > 0 {
+                println!();
+            }
+            print!("{}", format_read_text(&path, info.as_ref()));
+        }
+    }
+
+    if cli.json {
+        // Serialising straight from the struct (not via serde_json::Value,
+        // whose maps are sorted) keeps fields in ComicInfo schema order.
+        match serde_json::to_string_pretty(&records) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error: failed to encode JSON: {}", e);
+                return 1;
+            }
+        }
+    }
+
+    if errors > 0 { 1 } else { 0 }
+}
+
+/// Human-readable `--read` output: the path, then one indented `Field: value`
+/// line per present field in schema order.
+fn format_read_text(path: &str, info: Option<&ComicInfo>) -> String {
+    let mut out = format!("{}\n", path);
+    let Some(info) = info else {
+        out.push_str("  (no ComicInfo.xml)\n");
+        return out;
+    };
+    let value = serde_json::to_value(info).unwrap_or_default();
+    let mut any = false;
+    for field in FIELDS {
+        let Some(v) = value.get(*field) else { continue };
+        let text = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        // Keep multi-line values (Summary, Notes) visually inside their field.
+        out.push_str(&format!("  {}: {}\n", field, text.replace('\n', "\n    ")));
+        any = true;
+    }
+    if let Some(pages) = &info.pages {
+        let n = pages.pages.len();
+        out.push_str(&format!("  Pages: {} {}\n", n, if n == 1 { "entry" } else { "entries" }));
+        any = true;
+    }
+    if !any {
+        out.push_str("  (empty ComicInfo.xml)\n");
+    }
+    out
+}
+
 fn apply_field(info: &mut ComicInfo, name: &str, value: &str) -> Result<String, String> {
-    match name.to_ascii_lowercase().as_str() {
-        "title" => { info.title = Some(value.into()); Ok(fmt_str("Title", value)) }
-        "series" => { info.series = Some(value.into()); Ok(fmt_str("Series", value)) }
-        "number" => { info.number = Some(value.into()); Ok(fmt_str("Number", value)) }
-        "volume" => { let v = parse_i32("Volume", value)?; info.volume = Some(v); Ok(fmt_int("Volume", v)) }
-        "count" => { let v = parse_i32("Count", value)?; info.count = Some(v); Ok(fmt_int("Count", v)) }
-        "alternateseries" | "alternate_series" => { info.alternate_series = Some(value.into()); Ok(fmt_str("AlternateSeries", value)) }
-        "alternatenumber" | "alternate_number" => { info.alternate_number = Some(value.into()); Ok(fmt_str("AlternateNumber", value)) }
-        "alternatecount" | "alternate_count" => { let v = parse_i32("AlternateCount", value)?; info.alternate_count = Some(v); Ok(fmt_int("AlternateCount", v)) }
-        "summary" => { info.summary = Some(value.into()); Ok(fmt_str("Summary", value)) }
-        "notes" => { info.notes = Some(value.into()); Ok(fmt_str("Notes", value)) }
-        "year" => { let v = parse_i32("Year", value)?; info.year = Some(v); Ok(fmt_int("Year", v)) }
-        "month" => { let v = parse_i32("Month", value)?; info.month = Some(v); Ok(fmt_int("Month", v)) }
-        "day" => { let v = parse_i32("Day", value)?; info.day = Some(v); Ok(fmt_int("Day", v)) }
-        "writer" => { info.writer = Some(value.into()); Ok(fmt_str("Writer", value)) }
-        "penciller" => { info.penciller = Some(value.into()); Ok(fmt_str("Penciller", value)) }
-        "inker" => { info.inker = Some(value.into()); Ok(fmt_str("Inker", value)) }
-        "colorist" => { info.colorist = Some(value.into()); Ok(fmt_str("Colorist", value)) }
-        "letterer" => { info.letterer = Some(value.into()); Ok(fmt_str("Letterer", value)) }
-        "coverartist" | "cover_artist" => { info.cover_artist = Some(value.into()); Ok(fmt_str("CoverArtist", value)) }
-        "editor" => { info.editor = Some(value.into()); Ok(fmt_str("Editor", value)) }
-        "translator" => { info.translator = Some(value.into()); Ok(fmt_str("Translator", value)) }
-        "publisher" => { info.publisher = Some(value.into()); Ok(fmt_str("Publisher", value)) }
-        "imprint" => { info.imprint = Some(value.into()); Ok(fmt_str("Imprint", value)) }
-        "genre" => { info.genre = Some(value.into()); Ok(fmt_str("Genre", value)) }
-        "tags" => { info.tags = Some(value.into()); Ok(fmt_str("Tags", value)) }
-        "web" => { info.web = Some(value.into()); Ok(fmt_str("Web", value)) }
-        "pagecount" | "page_count" => { let v = parse_i32("PageCount", value)?; info.page_count = Some(v); Ok(fmt_int("PageCount", v)) }
-        "languageiso" | "language_iso" | "language" => { info.language_iso = Some(value.into()); Ok(fmt_str("LanguageISO", value)) }
-        "format" => { info.format = Some(value.into()); Ok(fmt_str("Format", value)) }
-        "blackandwhite" | "black_and_white" | "bw" => {
+    let field = resolve_field(name).ok_or_else(|| unknown_field(name))?;
+    match field {
+        "Title" => { info.title = Some(value.into()); Ok(fmt_str("Title", value)) }
+        "Series" => { info.series = Some(value.into()); Ok(fmt_str("Series", value)) }
+        "Number" => { info.number = Some(value.into()); Ok(fmt_str("Number", value)) }
+        "Volume" => { let v = parse_i32("Volume", value)?; info.volume = Some(v); Ok(fmt_int("Volume", v)) }
+        "Count" => { let v = parse_i32("Count", value)?; info.count = Some(v); Ok(fmt_int("Count", v)) }
+        "AlternateSeries" => { info.alternate_series = Some(value.into()); Ok(fmt_str("AlternateSeries", value)) }
+        "AlternateNumber" => { info.alternate_number = Some(value.into()); Ok(fmt_str("AlternateNumber", value)) }
+        "AlternateCount" => { let v = parse_i32("AlternateCount", value)?; info.alternate_count = Some(v); Ok(fmt_int("AlternateCount", v)) }
+        "Summary" => { info.summary = Some(value.into()); Ok(fmt_str("Summary", value)) }
+        "Notes" => { info.notes = Some(value.into()); Ok(fmt_str("Notes", value)) }
+        "Year" => { let v = parse_i32("Year", value)?; info.year = Some(v); Ok(fmt_int("Year", v)) }
+        "Month" => { let v = parse_i32("Month", value)?; info.month = Some(v); Ok(fmt_int("Month", v)) }
+        "Day" => { let v = parse_i32("Day", value)?; info.day = Some(v); Ok(fmt_int("Day", v)) }
+        "Writer" => { info.writer = Some(value.into()); Ok(fmt_str("Writer", value)) }
+        "Penciller" => { info.penciller = Some(value.into()); Ok(fmt_str("Penciller", value)) }
+        "Inker" => { info.inker = Some(value.into()); Ok(fmt_str("Inker", value)) }
+        "Colorist" => { info.colorist = Some(value.into()); Ok(fmt_str("Colorist", value)) }
+        "Letterer" => { info.letterer = Some(value.into()); Ok(fmt_str("Letterer", value)) }
+        "CoverArtist" => { info.cover_artist = Some(value.into()); Ok(fmt_str("CoverArtist", value)) }
+        "Editor" => { info.editor = Some(value.into()); Ok(fmt_str("Editor", value)) }
+        "Translator" => { info.translator = Some(value.into()); Ok(fmt_str("Translator", value)) }
+        "Publisher" => { info.publisher = Some(value.into()); Ok(fmt_str("Publisher", value)) }
+        "Imprint" => { info.imprint = Some(value.into()); Ok(fmt_str("Imprint", value)) }
+        "Genre" => { info.genre = Some(value.into()); Ok(fmt_str("Genre", value)) }
+        "Tags" => { info.tags = Some(value.into()); Ok(fmt_str("Tags", value)) }
+        "Web" => { info.web = Some(value.into()); Ok(fmt_str("Web", value)) }
+        "PageCount" => { let v = parse_i32("PageCount", value)?; info.page_count = Some(v); Ok(fmt_int("PageCount", v)) }
+        "LanguageISO" => { info.language_iso = Some(value.into()); Ok(fmt_str("LanguageISO", value)) }
+        "Format" => { info.format = Some(value.into()); Ok(fmt_str("Format", value)) }
+        "BlackAndWhite" => {
             let v = parse_yes_no("BlackAndWhite", value)?;
             info.black_and_white = Some(Lenient::Known(v));
             Ok(fmt_str("BlackAndWhite", value))
         }
-        "manga" => {
+        "Manga" => {
             let v = parse_manga("Manga", value)?;
             info.manga = Some(Lenient::Known(v));
             Ok(fmt_str("Manga", value))
         }
-        "characters" => { info.characters = Some(value.into()); Ok(fmt_str("Characters", value)) }
-        "teams" => { info.teams = Some(value.into()); Ok(fmt_str("Teams", value)) }
-        "locations" => { info.locations = Some(value.into()); Ok(fmt_str("Locations", value)) }
-        "scaninformation" | "scan_information" => { info.scan_information = Some(value.into()); Ok(fmt_str("ScanInformation", value)) }
-        "storyarc" | "story_arc" => { info.story_arc = Some(value.into()); Ok(fmt_str("StoryArc", value)) }
-        "storyarcnumber" | "story_arc_number" => { info.story_arc_number = Some(value.into()); Ok(fmt_str("StoryArcNumber", value)) }
-        "seriesgroup" | "series_group" => { info.series_group = Some(value.into()); Ok(fmt_str("SeriesGroup", value)) }
-        "agerating" | "age_rating" => {
+        "Characters" => { info.characters = Some(value.into()); Ok(fmt_str("Characters", value)) }
+        "Teams" => { info.teams = Some(value.into()); Ok(fmt_str("Teams", value)) }
+        "Locations" => { info.locations = Some(value.into()); Ok(fmt_str("Locations", value)) }
+        "ScanInformation" => { info.scan_information = Some(value.into()); Ok(fmt_str("ScanInformation", value)) }
+        "StoryArc" => { info.story_arc = Some(value.into()); Ok(fmt_str("StoryArc", value)) }
+        "StoryArcNumber" => { info.story_arc_number = Some(value.into()); Ok(fmt_str("StoryArcNumber", value)) }
+        "SeriesGroup" => { info.series_group = Some(value.into()); Ok(fmt_str("SeriesGroup", value)) }
+        "AgeRating" => {
             let v = parse_age_rating("AgeRating", value)?;
             info.age_rating = Some(Lenient::Known(v));
             Ok(fmt_str("AgeRating", value))
         }
-        "communityrating" | "community_rating" => {
+        "CommunityRating" => {
             let v: f64 = value.parse().map_err(|_| format!("'{}' is not a valid number for CommunityRating", value))?;
             info.community_rating = Some(v);
             Ok(format!("CommunityRating={}", v))
         }
-        "maincharacterorteam" | "main_character_or_team" => { info.main_character_or_team = Some(value.into()); Ok(fmt_str("MainCharacterOrTeam", value)) }
-        "review" => { info.review = Some(value.into()); Ok(fmt_str("Review", value)) }
-        "gtin" => { info.gtin = Some(value.into()); Ok(fmt_str("GTIN", value)) }
-        _ => Err(format!("Unknown field: '{}'. Run --help for a list of valid fields.", name)),
+        "MainCharacterOrTeam" => { info.main_character_or_team = Some(value.into()); Ok(fmt_str("MainCharacterOrTeam", value)) }
+        "Review" => { info.review = Some(value.into()); Ok(fmt_str("Review", value)) }
+        "GTIN" => { info.gtin = Some(value.into()); Ok(fmt_str("GTIN", value)) }
+        _ => unreachable!("resolve_field returned unhandled field {}", field),
     }
 }
 
@@ -461,19 +737,25 @@ fn usage() -> String {
         "Usage: comicinfo-editor [OPTIONS] <PATH>...
 
 Options:
+  --read               Print each file's metadata (read-only; no other
+                       operation may be combined with it)
+  --json               With --read, print a JSON array instead of text
   --infer              Fill missing metadata fields inferred from the filename
   --convert            Convert CBR/RAR and CB7/7z archives to CBZ alongside the
                        original (kept). Skipped if the .cbz already exists.
                        Combine with --infer/--set to edit the new CBZ.
                        RAR conversion requires unar.
   --set Field=Value    Set a specific metadata field (repeatable)
+  --clear Field        Remove a field entirely (repeatable). Applied after
+                       --infer and --set. Clearing PageCount makes it be
+                       recounted from the archive.
   --recursive, -r      Scan folders recursively (default: non-recursive)
   --help, -h           Show this help
 
 PATH can be a folder, a glob pattern (quoted), or individual .cbz files
 (plus .cbr/.rar/.cb7/.7z files with --convert).
 
-Fields for --set:
+Fields for --set and --clear (case-insensitive):
   String:  Series, Title, Number, AlternateSeries, AlternateNumber, Summary,
            Notes, Writer, Penciller, Inker, Colorist, Letterer, CoverArtist,
            Editor, Translator, Publisher, Imprint, Genre, Tags, Characters,
@@ -488,6 +770,9 @@ Fields for --set:
                       Kids to Adults/Rating Pending)
 
 Examples:
+  # Show the metadata of every CBZ in a folder (add --json for JSON)
+  comicinfo-editor --read /path/to/comics/
+
   # Infer metadata from filenames for all CBZ files in a folder
   comicinfo-editor --infer /path/to/comics/
 
@@ -499,6 +784,9 @@ Examples:
 
   # Convert every CBR/CB7 in a folder to CBZ, filling metadata from filenames
   comicinfo-editor --convert --infer /path/to/comics/
+
+  # Remove the Tags and Review fields from every file
+  comicinfo-editor --clear Tags --clear Review /path/to/comics/
 
   # Use a glob pattern (quote it to prevent shell expansion)
   comicinfo-editor --set Publisher=\"Viz\" \"/Volumes/Comics/**/*.cbz\" --recursive
@@ -642,6 +930,95 @@ mod tests {
         // Not a known field: leave it as an ordinary (missing) path.
         assert!(misplaced_set_field("draft=v2").is_none());
         assert!(misplaced_set_field("comics").is_none());
+    }
+
+    /// A ComicInfo with every field in FIELDS set, via the same path --set uses.
+    fn fully_populated() -> ComicInfo {
+        let mut info = ComicInfo::default();
+        for field in FIELDS {
+            // "3" suits text and numeric fields; the enums all accept "Unknown".
+            apply_field(&mut info, field, "3")
+                .or_else(|_| apply_field(&mut info, field, "Unknown"))
+                .unwrap_or_else(|e| panic!("{} could not be set: {}", field, e));
+        }
+        info
+    }
+
+    /// FIELDS drives --read's output, --clear and name resolution. A field
+    /// added to ComicInfo but not to FIELDS would be silently missing from all
+    /// three, so the serialised keys must match it exactly.
+    #[test]
+    fn fields_list_covers_every_comicinfo_field() {
+        let value = serde_json::to_value(fully_populated()).unwrap();
+        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut expected: Vec<&str> = FIELDS.to_vec();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn clear_removes_every_field() {
+        let mut info = fully_populated();
+        for field in FIELDS {
+            assert!(clear_field(&mut info, field), "{} was not reported present", field);
+            assert!(!clear_field(&mut info, field), "{} reported present twice", field);
+        }
+        assert_eq!(serde_json::to_value(&info).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn field_names_resolve_case_and_underscore_insensitively() {
+        assert_eq!(resolve_field("cover_artist"), Some("CoverArtist"));
+        assert_eq!(resolve_field("COVERARTIST"), Some("CoverArtist"));
+        assert_eq!(resolve_field("languageiso"), Some("LanguageISO"));
+        assert_eq!(resolve_field("language"), Some("LanguageISO"));
+        assert_eq!(resolve_field("BW"), Some("BlackAndWhite"));
+        assert_eq!(resolve_field("gtin"), Some("GTIN"));
+        assert_eq!(resolve_field("Pages"), None);
+        assert_eq!(resolve_field("Sereis"), None);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        std::iter::once("comicinfo-editor").chain(list.iter().copied()).map(String::from).collect()
+    }
+
+    #[test]
+    fn clear_and_read_option_rules() {
+        let cli = parse_args(args(&["--clear", "tags", "--clear=Tags", "--clear", "bw", "x"])).unwrap();
+        assert_eq!(cli.clear_fields, vec!["Tags", "BlackAndWhite"], "deduplicated and canonical");
+        assert!(is_cli_mode(&args(&["--clear", "Tags", "x"])));
+        assert!(is_cli_mode(&args(&["--read", "x"])));
+
+        let cli = parse_args(args(&["--read", "--json", "x"])).unwrap();
+        assert!(cli.read && cli.json);
+
+        for bad in [
+            &["--read", "--set", "Year=1", "x"][..],
+            &["--read", "--clear", "Year", "x"],
+            &["--read", "--convert", "x"],
+            &["--json", "--infer", "x"],
+            &["--set", "year=1", "--clear", "YEAR", "x"],
+            &["--clear", "Bogus", "x"],
+            &["--clear", "Tags", "Review", "x"],
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "accepted: {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn read_text_lists_present_fields_in_schema_order() {
+        let mut info = ComicInfo::default();
+        apply_field(&mut info, "Year", "2012").unwrap();
+        apply_field(&mut info, "Series", "Saga").unwrap();
+        apply_field(&mut info, "Summary", "one\ntwo").unwrap();
+        apply_field(&mut info, "Manga", "rtl").unwrap();
+        assert_eq!(
+            format_read_text("a.cbz", Some(&info)),
+            "a.cbz\n  Series: Saga\n  Summary: one\n    two\n  Year: 2012\n  Manga: YesAndRightToLeft\n"
+        );
+        assert_eq!(format_read_text("b.cbz", None), "b.cbz\n  (no ComicInfo.xml)\n");
+        assert_eq!(format_read_text("c.cbz", Some(&ComicInfo::default())), "c.cbz\n  (empty ComicInfo.xml)\n");
     }
 
     #[test]
