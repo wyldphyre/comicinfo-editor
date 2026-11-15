@@ -7,11 +7,9 @@
   ],
   "permissions": [
     "core:default",
-    "opener:default",
     "dialog:default",
     "dialog:allow-ask",
     "dialog:allow-save",
-    "deep-link:default",
     "core:window:allow-destroy"
   ]
 }

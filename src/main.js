@@ -536,14 +536,9 @@ function collectFormData() {
             } else {
                 data[dataKey] = DECIMAL_FIELDS.has(formId) ? num : Math.trunc(num);
             }
-        } else if (element.tagName === 'SELECT') {
-            // Handle enum fields
-            if (value === '') {
-                data[dataKey] = null;
-            } else {
-                data[dataKey] = value;
-            }
         } else {
+            // Text inputs and the enum selects alike: the select option values
+            // are already the serde enum spellings.
             data[dataKey] = value;
         }
     }

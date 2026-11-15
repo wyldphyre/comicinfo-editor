@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::comicinfo::{AgeRating, ComicInfo, Lenient, Manga, YesNo};
-use crate::filename_parser;
 
 pub struct CliArgs {
     pub infer: bool,
@@ -351,37 +350,7 @@ fn process_file(path: &Path, cli: &CliArgs) -> Result<Option<String>, String> {
     let mut changes: Vec<String> = Vec::new();
 
     if cli.infer {
-        let parsed = filename_parser::parse(path_str);
-
-        macro_rules! infer {
-            ($field:ident, $label:expr) => {
-                if info.$field.is_none() {
-                    if let Some(val) = parsed.$field {
-                        changes.push(format!("{}={:?}", $label, val));
-                        info.$field = Some(val);
-                    }
-                }
-            };
-        }
-
-        infer!(series, "Series");
-        infer!(volume, "Volume");
-        infer!(number, "Number");
-        infer!(year, "Year");
-
-        // name → title, artist → writer (field name mismatch between structs)
-        if info.title.is_none() {
-            if let Some(val) = parsed.name {
-                changes.push(format!("Title={:?}", val));
-                info.title = Some(val);
-            }
-        }
-        if info.writer.is_none() {
-            if let Some(val) = parsed.artist {
-                changes.push(format!("Writer={:?}", val));
-                info.writer = Some(val);
-            }
-        }
+        changes.extend(crate::infer_from_filename(&mut info, path_str));
     }
 
     for (name, value) in &cli.set_fields {
