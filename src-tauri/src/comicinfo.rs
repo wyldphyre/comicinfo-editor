@@ -13,24 +13,12 @@ pub enum YesNo {
     Yes,
 }
 
-impl Default for YesNo {
-    fn default() -> Self {
-        YesNo::Unknown
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Manga {
     Unknown,
     No,
     Yes,
     YesAndRightToLeft,
-}
-
-impl Default for Manga {
-    fn default() -> Self {
-        Manga::Unknown
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -60,12 +48,6 @@ pub enum AgeRating {
     Teen,
     #[serde(rename = "X18+")]
     X18,
-}
-
-impl Default for AgeRating {
-    fn default() -> Self {
-        AgeRating::Unknown
-    }
 }
 
 /// An enum-valued field that tolerates text the spec does not list.

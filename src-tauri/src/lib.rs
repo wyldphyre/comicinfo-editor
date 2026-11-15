@@ -5,7 +5,7 @@ pub mod cli;
 use comicinfo::ComicInfo;
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use zip::read::ZipArchive;
@@ -175,34 +175,13 @@ fn read_archive_full(path: &str) -> Result<OpenResult, String> {
     }
     let page_count = i32::try_from(images.len()).unwrap_or(i32::MAX);
 
-    let comic_xml = match find_comic_info(&archive) {
-        Some((index, _)) => {
-            let mut entry = archive
-                .by_index(index)
-                .map_err(|e| format!("Failed to read archive entry: {}", e))?;
-            let mut contents = String::new();
-            entry
-                .read_to_string(&mut contents)
-                .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
-            Some(contents)
-        }
-        None => None,
-    };
-
-    let comic_info = match comic_xml {
-        Some(xml) => ComicInfo::from_xml(&xml)?,
+    let comic_info = match comic_info_from_archive(&mut archive)? {
+        Some(info) => info,
         None => {
             // No ComicInfo.xml found — try to infer metadata from the filename
-            let parsed = filename_parser::parse(path);
-            ComicInfo {
-                series: parsed.series,
-                volume: parsed.volume,
-                number: parsed.number,
-                title: parsed.name,
-                writer: parsed.artist,
-                year: parsed.year,
-                ..ComicInfo::default()
-            }
+            let mut info = ComicInfo::default();
+            infer_from_filename(&mut info, path);
+            info
         }
     };
 
@@ -236,27 +215,87 @@ fn read_archive_full(path: &str) -> Result<OpenResult, String> {
     Ok(OpenResult { comic_info, page_count, cover })
 }
 
-/// Read the ComicInfo from a CBZ archive. Returns `None` if no ComicInfo.xml is present.
-pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
-
-    let Some((index, _)) = find_comic_info(&archive) else { return Ok(None) };
+/// Read and parse an open archive's ComicInfo.xml. `None` when it has none.
+fn comic_info_from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Option<ComicInfo>, String> {
+    let Some((index, _)) = find_comic_info(archive) else { return Ok(None) };
     let mut entry = archive.by_index(index).map_err(|e| format!("Failed to read archive entry: {}", e))?;
     let mut contents = String::new();
     entry.read_to_string(&mut contents)
         .map_err(|e| format!("Failed to read ComicInfo.xml: {}", e))?;
-    Ok(Some(ComicInfo::from_xml(&contents)?))
+    ComicInfo::from_xml(&contents).map(Some)
 }
 
-/// Read the ComicInfo out of an already-open archive, ignoring any failure —
-/// callers use this only to recover fields the incoming payload omitted.
-fn existing_comic_info(archive: &mut ZipArchive<File>) -> Option<ComicInfo> {
-    let (index, _) = find_comic_info(archive)?;
-    let mut entry = archive.by_index(index).ok()?;
-    let mut contents = String::new();
-    entry.read_to_string(&mut contents).ok()?;
-    ComicInfo::from_xml(&contents).ok()
+/// Read the ComicInfo from a CBZ archive. Returns `None` if no ComicInfo.xml is present.
+pub fn read_comic_info(path: &str) -> Result<Option<ComicInfo>, String> {
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("Failed to read archive: {}", e))?;
+    comic_info_from_archive(&mut archive)
+}
+
+/// Fill the fields of `info` that are still unset with values parsed from the
+/// file name, and describe each one filled (`Series="Saga"`, `Volume=1`).
+///
+/// The GUI (opening a file without metadata) and the CLI's --infer both go
+/// through here, so they can't drift apart on which fields are inferred.
+pub fn infer_from_filename(info: &mut ComicInfo, path: &str) -> Vec<String> {
+    let parsed = filename_parser::parse(path);
+    let mut filled = Vec::new();
+
+    macro_rules! fill {
+        ($target:ident, $source:ident, $label:expr) => {
+            if info.$target.is_none() {
+                if let Some(value) = parsed.$source {
+                    filled.push(format!("{}={:?}", $label, value));
+                    info.$target = Some(value);
+                }
+            }
+        };
+    }
+
+    fill!(series, series, "Series");
+    fill!(volume, volume, "Volume");
+    fill!(number, number, "Number");
+    fill!(year, year, "Year");
+    // The parser's names differ from ComicInfo's for these two.
+    fill!(title, name, "Title");
+    fill!(writer, artist, "Writer");
+
+    filled
+}
+
+/// Write `dest` through a temp file beside it. `fill` writes the content and
+/// hands the file back; only then is it fsync'd and renamed over `dest`.
+///
+/// Any failure removes the temp file, so an interrupted or failed write can
+/// neither truncate `dest` nor leave a stray .tmp. Without the fsync, a crash
+/// between write and rename could make the rename durable but not the data.
+fn write_atomically(dest: &Path, fill: impl FnOnce(File) -> Result<File, String>) -> Result<(), String> {
+    // Include the pid so two concurrent CLI runs over the same folder can't
+    // land on the same temp path and corrupt each other's output.
+    let temp_path = dest.with_file_name(format!(
+        "{}.{}.tmp",
+        dest.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+
+    let result = (|| -> Result<(), String> {
+        let file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let file = fill(file)?;
+        file.sync_all().map_err(|e| format!("Failed to flush temp file: {}", e))?;
+
+        // A fresh temp file gets default permissions, so when replacing an
+        // existing file, carry its permissions over first.
+        if let Ok(meta) = std::fs::metadata(dest) {
+            let _ = std::fs::set_permissions(&temp_path, meta.permissions());
+        }
+
+        std::fs::rename(&temp_path, dest).map_err(|e| format!("Failed to replace {}: {}", dest.display(), e))
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Write ComicInfo back into a CBZ archive, auto-populating PageCount if not set.
@@ -271,7 +310,11 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
     // with pages == None. Carry over whatever the archive already had instead
     // of destroying per-page bookmarks, cover markers, and dimensions.
     if comic_info.pages.is_none() {
-        comic_info.pages = existing_comic_info(&mut archive).and_then(|existing| existing.pages);
+        // Best effort: a stored copy we can't parse just means nothing to recover.
+        comic_info.pages = comic_info_from_archive(&mut archive)
+            .ok()
+            .flatten()
+            .and_then(|existing| existing.pages);
     }
 
     // Auto-populate PageCount if not provided
@@ -290,14 +333,8 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
     let target = find_comic_info(&archive).map(|(_, name)| name);
 
     let xml_content = comic_info.to_xml()?;
-    // Include the pid so two concurrent CLI runs over the same folder can't
-    // land on the same temp path and corrupt each other's output.
-    let temp_path = format!("{}.{}.tmp", path, std::process::id());
 
-    // Write to a temp file, then atomically rename over the original. On any
-    // failure, remove the temp file so we don't leave a partial .tmp behind.
-    let write_result = (|| -> Result<(), String> {
-        let temp_file = File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
+    write_atomically(Path::new(path), |temp_file| {
         let mut writer = ZipWriter::new(temp_file);
         let xml_options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -327,31 +364,8 @@ pub fn write_comic_info(path: &str, comic_info: ComicInfo) -> Result<(), String>
             writer.write_all(xml_content.as_bytes()).map_err(|e| format!("Failed to write content: {}", e))?;
         }
 
-        let finished = writer.finish().map_err(|e| format!("Failed to finalize archive: {}", e))?;
-        // Force the data out to disk before the rename. Without this, a crash
-        // or power loss in between can leave the rename durable while the
-        // contents are not — i.e. a truncated file where the original was.
-        finished.sync_all().map_err(|e| format!("Failed to flush temp file: {}", e))?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    // A fresh temp file gets default permissions, so copy the original's over
-    // before it takes its place.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&temp_path, meta.permissions());
-    }
-
-    if let Err(e) = std::fs::rename(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(format!("Failed to replace original file: {}", e));
-    }
-
-    Ok(())
+        writer.finish().map_err(|e| format!("Failed to finalize archive: {}", e))
+    })
 }
 
 /// Run blocking archive work off the async runtime. These commands are `async`,
@@ -511,17 +525,8 @@ fn extract_rar(source: &str, dest_dir: &Path) -> Result<(), String> {
 }
 
 fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
-    // Build into a temp file alongside the destination and rename on success,
-    // so a failure part-way through leaves no half-written .cbz behind.
-    let temp_path = dest_path.with_file_name(format!(
-        "{}.{}.tmp",
-        dest_path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-
-    let write_result = (|| -> Result<(), String> {
-        let dest_file = File::create(&temp_path)
-            .map_err(|e| format!("Failed to create CBZ file: {}", e))?;
+    // A failure part-way through must leave no half-written .cbz behind.
+    write_atomically(dest_path, |dest_file| {
         let mut writer = ZipWriter::new(dest_file);
         // Page images are already compressed, so deflating them costs CPU for
         // no gain — but ComicInfo.xml and text sidecars shrink a lot, and
@@ -558,22 +563,7 @@ fn pack_to_cbz(source_dir: &Path, dest_path: &Path) -> Result<(), String> {
                 .map_err(|e| format!("Failed to write content: {}", e))?;
         }
 
-        let finished = writer.finish()
-            .map_err(|e| format!("Failed to finalize CBZ: {}", e))?;
-        finished.sync_all()
-            .map_err(|e| format!("Failed to flush CBZ: {}", e))?;
-
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-
-    std::fs::rename(&temp_path, dest_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        format!("Failed to write converted file: {}", e)
+        writer.finish().map_err(|e| format!("Failed to finalize CBZ: {}", e))
     })
 }
 
@@ -675,8 +665,6 @@ pub fn run() {
     }
 
     builder
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             pending_file: Mutex::new(None),
